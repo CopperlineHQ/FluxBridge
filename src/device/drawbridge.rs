@@ -213,7 +213,7 @@ impl DrawBridge {
                 for shift in [6, 4, 2, 0] {
                     let code = (byte >> shift) & 3;
                     let at_index = code == 3;
-                    if at_index && mode != ReadMode::Fast {
+                    if at_index && mode != ReadMode::Normal {
                         if first_index {
                             complete = true;
                             break;
@@ -224,7 +224,7 @@ impl DrawBridge {
                     append_sequence(&mut bits, if code == 3 { 1 } else { code + 1 });
                 }
             } else {
-                if byte & 0x80 != 0 && mode != ReadMode::Fast {
+                if byte & 0x80 != 0 && mode != ReadMode::Normal {
                     if first_index {
                         complete = true;
                         continue;
@@ -235,7 +235,7 @@ impl DrawBridge {
                 append_sequence(&mut bits, (byte >> 5) & 3);
                 append_sequence(&mut bits, (byte >> 3) & 3);
             }
-            if mode == ReadMode::Fast && bits.len() >= target_bits {
+            if mode == ReadMode::Normal && bits.len() >= target_bits {
                 bits.truncate(target_bits);
                 complete = true;
             }
@@ -257,14 +257,14 @@ impl DrawBridge {
                 "DrawBridge stream did not contain a complete revolution".into(),
             ));
         }
-        if mode == ReadMode::Fast {
+        if mode == ReadMode::Normal {
             bits = bits_to_unaligned_revolution(&bits, self.high_density)?;
         }
         let bit_len = bits.len();
         let capture = RawCapture {
             words: pack_bits(&bits),
             bit_len,
-            index_aligned: mode != ReadMode::Fast && first_index,
+            index_aligned: mode != ReadMode::Normal && first_index,
         };
         validate_capture(&capture)?;
         self.status.disk_present = true;
@@ -403,7 +403,12 @@ impl Device for DrawBridge {
         Ok(())
     }
 
-    fn read_track(&mut self, mode: ReadMode, density: DensityMode) -> Result<RawCapture> {
+    fn read_track(
+        &mut self,
+        mode: ReadMode,
+        density: DensityMode,
+        _progress: &mut dyn FnMut(Vec<u16>, usize),
+    ) -> Result<RawCapture> {
         self.choose_density(density)?;
         self.read_stream(mode)
     }

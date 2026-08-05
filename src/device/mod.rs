@@ -39,7 +39,12 @@ pub(crate) trait Device: Send {
     fn seek(&mut self, cylinder: u8) -> Result<()>;
     fn select_side(&mut self, side: crate::Side) -> Result<()>;
     fn no_click_step(&mut self) -> Result<()>;
-    fn read_track(&mut self, mode: ReadMode, density: DensityMode) -> Result<RawCapture>;
+    fn read_track(
+        &mut self,
+        mode: ReadMode,
+        density: DensityMode,
+        progress: &mut dyn FnMut(Vec<u16>, usize),
+    ) -> Result<RawCapture>;
     fn write_track(
         &mut self,
         words: &[u16],

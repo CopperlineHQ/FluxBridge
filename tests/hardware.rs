@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#![cfg(feature = "hardware-tests")]
-
 //! Explicit, ignored probes for a user-selected physical interface and disk.
+#![cfg(feature = "hardware-tests")]
 
 use std::str::FromStr;
 use std::thread;
@@ -288,4 +287,38 @@ fn amigados_sample_probe() {
     assert!(name_len > 0, "root block has an empty volume name");
     let volume_name = String::from_utf8_lossy(&root_sector[433..433 + name_len]);
     println!("AmigaDOS root block volume name: {volume_name}");
+}
+
+/// Times a series of captures, so the cost of moving a stream off the
+/// interface can be told apart from the rotation it came from.
+///
+/// A revolution is 200 ms and nothing can shorten it. Anything beyond that is
+/// the host's own doing: waiting for an index, moving bytes over USB, and
+/// recovering cells from them.
+#[test]
+#[ignore = "requires explicitly selected physical hardware"]
+fn capture_timing() {
+    let mut bridge = Bridge::open(&hardware_config()).expect("open bridge");
+    bridge.set_motor(Side::Lower, true).expect("motor on");
+    thread::sleep(Duration::from_secs(1));
+
+    for cylinder in [20_u8, 21] {
+        let track = TrackAddress {
+            cylinder,
+            side: Side::Lower,
+        };
+        // Prime: the first capture on a track pays the seek as well.
+        let _ = wait_for_capture(&mut bridge, track);
+
+        let passes = 6;
+        let started = Instant::now();
+        for _ in 0..passes {
+            bridge.advance_revolution(track).expect("advance");
+            let _ = wait_for_capture(&mut bridge, track);
+        }
+        let each = started.elapsed().as_secs_f64() * 1e3 / f64::from(passes);
+        println!("cylinder {cylinder}: {each:.0} ms per capture");
+    }
+
+    bridge.set_motor(Side::Lower, false).expect("motor off");
 }

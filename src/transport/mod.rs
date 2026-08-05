@@ -51,6 +51,49 @@ pub(crate) fn read_exact_until(
     Ok(())
 }
 
+/// Reads until the stream's zero terminator, in chunks.
+///
+/// The flux encodings never emit a zero byte, so one unambiguously ends the
+/// stream and the length need not be known in advance. Read a byte at a time,
+/// a capture costs a timeout adjustment and a read call per byte -- some
+/// hundred and fifty thousand of each per revolution -- all competing with an
+/// emulator for the host. Over-reading cannot happen: the interfaces answer
+/// commands and send nothing after the terminator until the next one arrives.
+pub(crate) fn read_terminated_until(
+    transport: &mut dyn Transport,
+    deadline: Instant,
+    limit: usize,
+    operation: &'static str,
+) -> Result<Vec<u8>> {
+    let mut stream = Vec::with_capacity(128 * 1024);
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        if stream.len() >= limit {
+            return Ok(stream);
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(Error::Timeout(operation))?;
+        transport.set_timeout(remaining.min(DEFAULT_TIMEOUT))?;
+        match transport.read(&mut chunk) {
+            Ok(0) => return Err(Error::Disconnected),
+            Ok(read) => {
+                if let Some(end) = chunk[..read].iter().position(|&byte| byte == 0) {
+                    stream.extend_from_slice(&chunk[..end]);
+                    return Ok(stream);
+                }
+                stream.extend_from_slice(&chunk[..read]);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 pub(crate) fn write_all_until(
     transport: &mut dyn Transport,
     mut input: &[u8],
@@ -162,12 +205,30 @@ mod serial {
         Ok(Box::new(SerialTransport(port)))
     }
 
+    /// Whether a serial device node is one that can actually be opened.
+    ///
+    /// macOS exposes every serial device twice: `/dev/cu.*` is the call-out
+    /// node, and `/dev/tty.*` the call-in node, which blocks on open until
+    /// carrier detect is asserted. A USB CDC device never asserts it, so
+    /// opening the `tty` node hangs. Listing only the `cu` node also stops one
+    /// interface appearing as two.
+    #[cfg(target_os = "macos")]
+    fn is_openable(port_name: &str) -> bool {
+        !port_name.starts_with("/dev/tty.")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn is_openable(_port_name: &str) -> bool {
+        true
+    }
+
     pub(super) fn list() -> Result<Vec<PortInfo>> {
         serialport::available_ports()
             .map_err(map_error)
             .and_then(|ports| {
                 ports
                     .into_iter()
+                    .filter(|port| is_openable(&port.port_name))
                     .map(|port| {
                         let (vid, pid, serial_number, product) = match port.port_type {
                             SerialPortType::UsbPort(usb) => {

@@ -14,8 +14,6 @@ bitflags! {
     /// Optional facilities implemented by a bridge driver.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct Capabilities: u32 {
-        /// Background capture of tracks adjacent to the active track.
-        const AUTO_CACHE = 1 << 0;
         /// Automatic serial-port discovery.
         const AUTO_DETECT_PORT = 1 << 1;
         /// IBM PC Drive A/Drive B cable selection.
@@ -93,30 +91,32 @@ pub struct DriverInfo {
     pub capabilities: Capabilities,
 }
 
-/// Drivers compiled into this build.
+/// Drivers compiled into this build, most mature first.
+///
+/// The order is meaningful: [`crate::drivers`] hands it to embedding
+/// applications for menus, and [`BridgeConfig::default`] selects the first
+/// entry, so the best-supported driver leads.
 pub(crate) static DRIVERS: &[DriverInfo] = &[
-    #[cfg(feature = "drawbridge")]
-    DriverInfo {
-        kind: DriverKind::DrawBridge,
-        name: "DrawBridge",
-        manufacturer: "RobSmithDev",
-        url: "https://amiga.robsmithdev.co.uk/",
-        capabilities: Capabilities::AUTO_CACHE
-            .union(Capabilities::AUTO_DETECT_PORT)
-            .union(Capabilities::HIGH_DENSITY)
-            .union(Capabilities::DIRECT_FTDI),
-    },
     #[cfg(feature = "greaseweazle")]
     DriverInfo {
         kind: DriverKind::Greaseweazle,
         name: "Greaseweazle",
         manufacturer: "Keir Fraser",
         url: "https://github.com/keirf/greaseweazle",
-        capabilities: Capabilities::AUTO_CACHE
-            .union(Capabilities::AUTO_DETECT_PORT)
+        capabilities: Capabilities::AUTO_DETECT_PORT
             .union(Capabilities::PC_DRIVE_SELECT)
             .union(Capabilities::SHUGART_DRIVE_SELECT)
             .union(Capabilities::HIGH_DENSITY),
+    },
+    #[cfg(feature = "drawbridge")]
+    DriverInfo {
+        kind: DriverKind::DrawBridge,
+        name: "DrawBridge",
+        manufacturer: "RobSmithDev",
+        url: "https://amiga.robsmithdev.co.uk/",
+        capabilities: Capabilities::AUTO_DETECT_PORT
+            .union(Capabilities::HIGH_DENSITY)
+            .union(Capabilities::DIRECT_FTDI),
     },
     #[cfg(feature = "supercard-pro")]
     DriverInfo {
@@ -124,8 +124,7 @@ pub(crate) static DRIVERS: &[DriverInfo] = &[
         name: "SuperCard Pro",
         manufacturer: "CBMSTUFF.COM",
         url: "https://www.cbmstuff.com/",
-        capabilities: Capabilities::AUTO_CACHE
-            .union(Capabilities::AUTO_DETECT_PORT)
+        capabilities: Capabilities::AUTO_DETECT_PORT
             .union(Capabilities::PC_DRIVE_SELECT)
             .union(Capabilities::HIGH_DENSITY),
     },
@@ -203,7 +202,7 @@ pub enum PortSelection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReadMode {
     /// Capture without waiting for the index pulse.
-    Fast,
+    Normal,
     /// Capture an index-aligned revolution.
     #[default]
     Compatible,
@@ -307,21 +306,21 @@ pub struct BridgeConfig {
     pub drive: DriveSelect,
     /// Port selection.
     pub port: PortSelection,
-    /// Whether the worker may capture nearby tracks while idle.
-    pub auto_cache: bool,
     /// Maximum duration for a stalling read.
     pub stall_timeout: Duration,
 }
 
 impl Default for BridgeConfig {
+    /// Defaults to the first compiled driver (see [`crate::drivers`]).
     fn default() -> Self {
         Self {
-            driver: DriverKind::DrawBridge,
+            driver: DRIVERS
+                .first()
+                .map_or(DriverKind::Greaseweazle, |driver| driver.kind),
             mode: ReadMode::Compatible,
             density: DensityMode::Auto,
             drive: DriveSelect::PcA,
             port: PortSelection::Auto,
-            auto_cache: false,
             stall_timeout: Duration::from_millis(450),
         }
     }

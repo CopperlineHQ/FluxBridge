@@ -101,11 +101,30 @@ pub fn flux_to_unaligned_revolution(
     Ok((pack_bits(&bits), bit_len))
 }
 
+/// Cells to leave untouched at the head of a capture before anything anchors
+/// to it.
+///
+/// The first cells are decoded while the PLL is still pulling toward the
+/// disk's real rate, and the very first interval is cut short by wherever the
+/// capture happened to begin -- the least trustworthy stretch in the whole
+/// stream. A comparison anchored inside it scores mismatches that are decode
+/// noise, not disagreement between the two passes over the flux.
+const JOIN_WARMUP_CELLS: usize = 2_000;
+
+/// Cells compared per anchor when scoring a candidate join.
+const JOIN_SAMPLE_CELLS: usize = 1_024;
+
+/// Offsets of the anchors a candidate join is proved against, past the
+/// warm-up. Spread out so one patch of weak oxide under a single anchor
+/// cannot veto a join the others prove: a marginal track has exactly such
+/// patches, and where the capture begins relative to them is chance.
+const JOIN_ANCHORS: [usize; 3] = [0, 2_048, 4_096];
+
 /// Locates a repeated revolution boundary in an immediate decoded bit stream.
 ///
 /// The capture must contain at least one revolution plus an overlap. Candidate
-/// joins are searched around the physical DD or HD revolution length and
-/// scored over 1,024 cells, as in the original rotation extractor.
+/// joins are searched around the physical DD or HD revolution length, and each
+/// must repeat the stream at a majority of the anchors to be believed.
 ///
 /// # Errors
 ///
@@ -113,31 +132,53 @@ pub fn flux_to_unaligned_revolution(
 pub fn bits_to_unaligned_revolution(bits: &[bool], high_density: bool) -> Result<Vec<bool>> {
     let nominal = if high_density { 200_000 } else { 100_000 };
     let lower = nominal * 4 / 5;
-    let upper = (nominal * 6 / 5).min(bits.len().saturating_sub(1_024));
-    if upper <= lower || bits.len() < lower + 1_024 {
+    let reach = JOIN_WARMUP_CELLS + JOIN_ANCHORS[JOIN_ANCHORS.len() - 1] + JOIN_SAMPLE_CELLS;
+    let upper = (nominal * 6 / 5).min(bits.len().saturating_sub(reach));
+    if upper <= lower || bits.len() < lower + reach {
         return Err(Error::Protocol(
             "immediate capture is too short to locate a revolution overlap".into(),
         ));
     }
-    let sample = 1_024;
-    let mut best = (0_usize, 0_usize);
-    for candidate in lower..=upper {
-        let score = bits[..sample]
+
+    // The correlation peak is a single cell wide -- one cell off, and the two
+    // windows are unrelated streams -- so every candidate must be scanned.
+    // Scan with one anchor and prove the winner against the rest; only if the
+    // winner fails does the next anchor lead a fresh scan, which is the rare
+    // case of the leading anchor itself sitting on damaged oxide.
+    let score_at = |anchor: usize, candidate: usize| {
+        let from = JOIN_WARMUP_CELLS + anchor;
+        bits[from..from + JOIN_SAMPLE_CELLS]
             .iter()
-            .zip(&bits[candidate..candidate + sample])
+            .zip(&bits[from + candidate..from + candidate + JOIN_SAMPLE_CELLS])
             .filter(|(left, right)| left == right)
+            .count()
+    };
+    let convincing = JOIN_SAMPLE_CELLS * 3 / 4;
+    let mut nearest = 0_usize;
+    for leader in JOIN_ANCHORS {
+        let mut best = (0_usize, 0_usize);
+        for candidate in lower..=upper {
+            let score = score_at(leader, candidate);
+            if score > best.1 {
+                best = (candidate, score);
+            }
+        }
+        nearest = nearest.max(best.1);
+        if best.1 < convincing {
+            continue;
+        }
+        let agreeing = JOIN_ANCHORS
+            .iter()
+            .filter(|&&anchor| score_at(anchor, best.0) >= convincing)
             .count();
-        if score > best.1 {
-            best = (candidate, score);
+        if agreeing * 2 > JOIN_ANCHORS.len() {
+            return Ok(bits[..best.0].to_vec());
         }
     }
-    if best.1 < sample * 3 / 4 {
-        return Err(Error::Protocol(format!(
-            "could not locate a reliable revolution overlap (best score {}/{sample})",
-            best.1
-        )));
-    }
-    Ok(bits[..best.0].to_vec())
+    Err(Error::Protocol(format!(
+        "could not locate a reliable revolution overlap (best score \
+         {nearest}/{JOIN_SAMPLE_CELLS})"
+    )))
 }
 
 /// Converts packed MFM to transition delays for flux-writing interfaces.

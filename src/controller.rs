@@ -18,31 +18,84 @@ use crate::{
 
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 64;
+/// Hard ceiling on readings kept per track. How many are wanted at any moment
+/// is decided by [`wanted_depth`]; this only bounds the queue behind it.
 const CAPTURES_PER_TRACK: usize = 2;
 const MAX_CACHED_TRACKS: usize = 8;
 const INDEX_WRITE_SLACK_BITS: usize = 30;
 
 enum Command {
-    Motor { side: crate::Side, enabled: bool },
-    Seek(TrackAddress),
     NoClick(crate::Side),
-    Advance(TrackAddress),
     Write { id: WriteId, request: WriteRequest },
     Shutdown,
 }
+
+/// The caller's latest wish for the mechanism, overwritten rather than queued.
+///
+/// An emulated machine expresses motor and head state thousands of times a
+/// second -- every guest step pulse, every CIA motor write, every poll for the
+/// track under the head. Queuing those as commands replays the machine's whole
+/// journey against a device that can only move so fast, and a full queue loses
+/// whichever command arrives next; the loss of a motor transition leaves the
+/// worker's view of the drive permanently wrong. Only the *latest* state can
+/// matter to a physical mechanism, so that is all this keeps.
+#[derive(Default, Clone, Copy)]
+struct Desired {
+    motor: Option<(crate::Side, bool)>,
+    /// Where the head belongs. Follows the machine's stepper, including every
+    /// cylinder it passes through mid-seek.
+    target: Option<TrackAddress>,
+    /// The track somebody is actually waiting to read. Only this is worth a
+    /// capture: the head passes dozens of cylinders on its way somewhere, and
+    /// a reading taken of one of them costs a whole uninterruptible window
+    /// that the destination then queues behind.
+    wanted: Option<TrackAddress>,
+}
+
+/// A capture still on its way in: the track decoded as far as the platter has
+/// turned, republished as it grows so a consumer can read the early sectors
+/// while the later ones are still passing the head.
+struct PartialCapture {
+    track: TrackAddress,
+    words: Vec<u16>,
+    bit_len: usize,
+}
+
+/// Everything a worker shares with the [`Bridge`] that owns it.
+struct SharedState {
+    status: Arc<Mutex<DriveStatus>>,
+    captures: Arc<Mutex<CaptureCache>>,
+    desired: Arc<Mutex<Desired>>,
+    partial: Arc<Mutex<Option<PartialCapture>>>,
+    nudge: Receiver<()>,
+}
+
+/// Consecutive device errors after which the drive is declared lost.
+///
+/// A spinning mechanism has weather -- an overflowed capture, a read racing a
+/// motor toggle -- and a single failure says nothing. A cable that has been
+/// pulled fails every time, which is what this distinguishes.
+const MAX_CONSECUTIVE_ERRORS: u32 = 20;
 
 type CaptureCache = HashMap<TrackAddress, VecDeque<TrackCapture>>;
 
 /// One open physical drive.
 ///
 /// The transport and every mutable hardware fact are owned by a worker
-/// thread. Public methods only enqueue bounded commands or inspect snapshots,
-/// so normal reads never block the caller on a rotating disk.
+/// thread. Public methods record latest-wins wishes (motor, head position,
+/// the track worth capturing), enqueue the few real commands (writes,
+/// shutdown, the no-click step), or inspect snapshots, so normal reads never
+/// block the caller on a rotating disk.
 pub struct Bridge {
     commands: Sender<Command>,
     events: Receiver<BridgeEvent>,
     status: Arc<Mutex<DriveStatus>>,
     captures: Arc<Mutex<CaptureCache>>,
+    desired: Arc<Mutex<Desired>>,
+    partial: Arc<Mutex<Option<PartialCapture>>>,
+    /// Wakes the worker the moment a wish changes, so acting on it is not held
+    /// for the tail of a poll interval.
+    nudge: Sender<()>,
     selected_port: PortId,
     next_write: u64,
     max_cylinders: u8,
@@ -74,21 +127,21 @@ impl Bridge {
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let status = Arc::new(Mutex::new(initial_status));
         let captures = Arc::new(Mutex::new(HashMap::new()));
-        let worker_status = Arc::clone(&status);
-        let worker_captures = Arc::clone(&captures);
+        let desired = Arc::new(Mutex::new(Desired::default()));
+        let (nudge_tx, nudge_rx) = bounded(1);
+        let partial = Arc::new(Mutex::new(None));
+        let shared = SharedState {
+            status: Arc::clone(&status),
+            captures: Arc::clone(&captures),
+            desired: Arc::clone(&desired),
+            partial: Arc::clone(&partial),
+            nudge: nudge_rx,
+        };
         let stall_timeout = (config.mode == ReadMode::Stalling).then_some(config.stall_timeout);
         let worker = thread::Builder::new()
             .name(format!("fluxbridge-{}", config.driver))
             .spawn(move || {
-                Worker::new(
-                    config,
-                    device,
-                    command_rx,
-                    event_tx,
-                    worker_status,
-                    worker_captures,
-                )
-                .run();
+                Worker::new(config, device, command_rx, event_tx, shared).run();
             })
             .expect("FluxBridge worker thread creation must succeed");
 
@@ -97,12 +150,21 @@ impl Bridge {
             events: event_rx,
             status,
             captures,
+            desired,
+            partial,
+            nudge: nudge_tx,
             selected_port,
             next_write: 1,
             max_cylinders: initial_status.max_cylinders,
             stall_timeout,
             worker: Some(worker),
         }
+    }
+
+    /// Wakes the worker so a fresh wish is seen now rather than at the end of
+    /// its poll interval. A full slot already means a wake-up is on its way.
+    fn nudge(&self) {
+        let _ = self.nudge.try_send(());
     }
 
     /// Returns the port selected during open.
@@ -115,21 +177,27 @@ impl Bridge {
         *lock(&self.status)
     }
 
-    /// Enqueues a motor transition.
+    /// Records the desired motor state, applied by the worker as its next act.
+    ///
+    /// State rather than a command: an emulated machine toggles the motor as
+    /// often as its guest pleases, and only the latest wish can matter to a
+    /// physical spindle. Cannot fail and cannot be lost.
     pub fn set_motor(&mut self, side: crate::Side, enabled: bool) -> Result<()> {
-        self.enqueue(Command::Motor { side, enabled })
+        lock(&self.desired).motor = Some((side, enabled));
+        self.nudge();
+        Ok(())
     }
 
-    /// Enqueues a seek and side selection, clamped to the physical mechanism.
+    /// Records where the head should be, clamped to the physical mechanism.
     ///
-    /// If the bounded queue is already full, the request is coalesced: callers
-    /// may name the desired track again on their next read without turning
-    /// repeated step or side signals into a hard failure.
+    /// State rather than a command, so a guest stepping every three
+    /// milliseconds steers the head without replaying its whole journey: the
+    /// worker moves to wherever the head belongs *now*, not through every
+    /// cylinder it was ever asked for on the way.
     pub fn seek(&mut self, track: TrackAddress) -> Result<()> {
-        self.enqueue_coalescing(Command::Seek(device::clamp_track(
-            track,
-            self.max_cylinders,
-        )))
+        lock(&self.desired).target = Some(device::clamp_track(track, self.max_cylinders));
+        self.nudge();
+        Ok(())
     }
 
     /// Requests the no-click step used by track-zero disk-change detection.
@@ -140,7 +208,11 @@ impl Bridge {
     /// Returns the newest completed capture for a track, if one is ready.
     pub fn read_track(&mut self, track: TrackAddress) -> Result<Option<TrackCapture>> {
         let track = device::clamp_track(track, self.max_cylinders);
-        self.enqueue_coalescing(Command::Seek(track))?;
+        {
+            let mut desired = lock(&self.desired);
+            desired.target = Some(track);
+            desired.wanted = Some(track);
+        }
         let capture = || {
             lock(&self.captures)
                 .get(&track)
@@ -150,6 +222,9 @@ impl Bridge {
         if let Some(capture) = capture() {
             return Ok(Some(capture));
         }
+        // A miss means someone is actively waiting on this track: worth waking
+        // the worker for, where a hit needed nothing from it.
+        self.nudge();
         if let Some(timeout) = self.stall_timeout {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
@@ -165,13 +240,36 @@ impl Bridge {
         Ok(None)
     }
 
+    /// Returns the capture in flight for a track, as far as it has got.
+    ///
+    /// The words are the decode of the flux the head has passed so far, so a
+    /// consumer can serve them while the rest of the revolution is still
+    /// arriving -- reading behind the platter exactly as a real controller
+    /// does. Grows monotonically until [`Self::read_track`] hands over the
+    /// finished revolution.
+    pub fn partial_track(&mut self, track: TrackAddress) -> Option<(Vec<u16>, usize)> {
+        let track = device::clamp_track(track, self.max_cylinders);
+        lock(&self.partial)
+            .as_ref()
+            .filter(|partial| partial.track == track && partial.bit_len > 0)
+            .map(|partial| (partial.words.clone(), partial.bit_len))
+    }
+
     /// Retires a consumed capture so a later read can return fresh flux.
     pub fn advance_revolution(&mut self, track: TrackAddress) -> Result<()> {
         let track = device::clamp_track(track, self.max_cylinders);
         if let Some(captures) = lock(&self.captures).get_mut(&track) {
             captures.pop_front();
         }
-        self.enqueue_coalescing(Command::Advance(track))
+        // The worker refills any track below its capture depth on its own;
+        // naming the track keeps the head there while it does.
+        {
+            let mut desired = lock(&self.desired);
+            desired.target = Some(track);
+            desired.wanted = Some(track);
+        }
+        self.nudge();
+        Ok(())
     }
 
     /// Accepts a validated asynchronous write and returns its identifier.
@@ -242,13 +340,6 @@ impl Bridge {
                 TrySendError::Disconnected(_) => Error::WorkerStopped,
             })
     }
-
-    fn enqueue_coalescing(&self, command: Command) -> Result<()> {
-        match self.commands.try_send(command) {
-            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
-            Err(TrySendError::Disconnected(_)) => Err(Error::WorkerStopped),
-        }
-    }
 }
 
 impl Drop for Bridge {
@@ -277,13 +368,26 @@ struct Worker {
     events: Sender<BridgeEvent>,
     status: Arc<Mutex<DriveStatus>>,
     captures: Arc<Mutex<CaptureCache>>,
+    desired: Arc<Mutex<Desired>>,
+    partial: Arc<Mutex<Option<PartialCapture>>>,
+    nudge: Receiver<()>,
     target: TrackAddress,
+    /// The last track a consumer actually asked to read, which is the only
+    /// thing worth spending a capture window on. `None` until the first ask.
+    wanted: Option<TrackAddress>,
     physical: TrackAddress,
     positioned: bool,
     failed: bool,
+    /// Device errors since the last success. A mechanism mid-spin produces
+    /// occasional weather; only an unbroken run of failures means the drive is
+    /// really gone.
+    consecutive_errors: u32,
+    /// When the spindle was last switched off. A platter coasts for a while,
+    /// so a restart inside that window needs no fresh spin-up wait -- the
+    /// guest's own emulated spin-up already covers what little is left.
+    motor_stopped_at: Option<Instant>,
     generation: u64,
     next_status: Instant,
-    cache_cursor: u8,
 }
 
 impl Worker {
@@ -292,33 +396,47 @@ impl Worker {
         device: Box<dyn Device>,
         commands: Receiver<Command>,
         events: Sender<BridgeEvent>,
-        status: Arc<Mutex<DriveStatus>>,
-        captures: Arc<Mutex<CaptureCache>>,
+        shared: SharedState,
     ) -> Self {
         Self {
             config,
             device,
             commands,
             events,
-            status,
-            captures,
+            status: shared.status,
+            captures: shared.captures,
+            desired: shared.desired,
+            partial: shared.partial,
+            nudge: shared.nudge,
             target: TrackAddress::default(),
+            wanted: None,
             physical: TrackAddress::default(),
             positioned: false,
             failed: false,
+            consecutive_errors: 0,
+            motor_stopped_at: None,
             generation: 0,
             next_status: Instant::now(),
-            cache_cursor: 0,
         }
     }
 
     fn run(mut self) {
         let mut shutdown = false;
+        // Set when the previous pass took a reading: more work is likely
+        // waiting -- the retry behind an unproven capture, or a target that
+        // moved while the disk was turning -- so go straight round rather
+        // than sleeping on the channels.
+        let mut hot = false;
         while !shutdown {
-            match self.commands.recv_timeout(Duration::from_millis(5)) {
-                Ok(command) => shutdown = self.process(command),
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            if !hot {
+                crossbeam_channel::select! {
+                    recv(self.commands) -> command => match command {
+                        Ok(command) => shutdown = self.process(command),
+                        Err(_) => break,
+                    },
+                    recv(self.nudge) -> _ => {}
+                    default(Duration::from_millis(5)) => {}
+                }
             }
             if shutdown {
                 break;
@@ -332,11 +450,15 @@ impl Worker {
             if shutdown {
                 break;
             }
+            self.apply_desired();
+            if self.failed {
+                break;
+            }
             self.refresh_status_if_due();
             if self.failed {
                 break;
             }
-            self.capture_if_needed();
+            hot = self.capture_if_needed();
             if self.failed {
                 break;
             }
@@ -347,17 +469,6 @@ impl Worker {
 
     fn process(&mut self, command: Command) -> bool {
         let result = match command {
-            Command::Motor { side, enabled } => self
-                .position(TrackAddress {
-                    cylinder: self.target.cylinder,
-                    side,
-                })
-                .and_then(|()| self.device.set_motor(enabled, false))
-                .map(|()| lock(&self.status).motor_running = enabled),
-            Command::Seek(track) | Command::Advance(track) => {
-                self.target = track;
-                self.position(track)
-            }
             Command::NoClick(side) => self
                 .device
                 .select_side(side)
@@ -369,10 +480,68 @@ impl Worker {
             Command::Shutdown => return true,
         };
         if let Err(error) = result {
-            self.disconnect(error);
-            return true;
+            self.note_error(error);
         }
-        false
+        self.failed
+    }
+
+    /// Applies the caller's latest motor and head wishes.
+    ///
+    /// Runs at the top of every loop, so a capture is only ever begun with the
+    /// freshest view of what the machine wants -- a motor turned off between
+    /// loops is seen before the next read would have spun against it.
+    fn apply_desired(&mut self) {
+        let wish = {
+            let mut desired = lock(&self.desired);
+            Desired {
+                motor: desired.motor.take(),
+                target: desired.target.take(),
+                wanted: desired.wanted.take(),
+            }
+        };
+        if let Some(track) = wish.wanted {
+            self.wanted = Some(track);
+        }
+        if let Some(track) = wish.target {
+            self.target = track;
+            if let Err(error) = self.position(track) {
+                self.note_error(error);
+                return;
+            }
+            self.consecutive_errors = 0;
+        }
+        if let Some((side, enabled)) = wish.motor {
+            let quick = !enabled
+                || self
+                    .motor_stopped_at
+                    .is_some_and(|stopped| stopped.elapsed() < Duration::from_secs(2));
+            let result = self
+                .position(TrackAddress {
+                    cylinder: self.target.cylinder,
+                    side,
+                })
+                .and_then(|()| self.device.set_motor(enabled, quick))
+                .map(|()| lock(&self.status).motor_running = enabled);
+            match result {
+                Ok(()) => {
+                    self.consecutive_errors = 0;
+                    if !enabled {
+                        self.motor_stopped_at = Some(Instant::now());
+                    }
+                }
+                Err(error) => self.note_error(error),
+            }
+        }
+    }
+
+    /// Counts a device error, declaring the drive lost only when errors run
+    /// unbroken or the device is positively gone.
+    fn note_error(&mut self, error: Error) {
+        self.consecutive_errors += 1;
+        let fatal = matches!(error, Error::Disconnected | Error::WorkerStopped);
+        if fatal || self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+            self.disconnect(error);
+        }
     }
 
     fn position(&mut self, track: TrackAddress) -> Result<()> {
@@ -398,8 +567,8 @@ impl Worker {
             bit_len,
             start_bit,
         } = request;
-        // Restore both coordinates immediately before every write. Auto-cache
-        // may have moved either one since the request was queued.
+        // Restore both coordinates immediately before every write: the head
+        // may have moved for a capture since the request was queued.
         let result = self.position(track).and_then(|()| {
             let track_bits = lock(&self.captures)
                 .get(&track)
@@ -427,49 +596,69 @@ impl Worker {
         let _ = self.events.try_send(event);
     }
 
-    fn capture_if_needed(&mut self) {
+    /// Captures whatever the cache is short of, returning whether a reading
+    /// was actually taken -- the signal to go straight round again rather than
+    /// wait for something to ask.
+    fn capture_if_needed(&mut self) -> bool {
         let status = *lock(&self.status);
         if !status.working || !status.motor_running || !status.disk_present {
-            return;
+            return false;
         }
 
-        let mut wanted = self.target;
-        let target_full = lock(&self.captures)
-            .get(&self.target)
-            .is_some_and(|captures| captures.len() >= CAPTURES_PER_TRACK);
-        if target_full && self.config.auto_cache {
-            let max = status.max_cylinders.max(1);
-            self.cache_cursor = self.cache_cursor.wrapping_add(1) % max;
-            wanted.cylinder = self.cache_cursor;
-            if lock(&self.captures)
-                .get(&wanted)
-                .is_some_and(|captures| !captures.is_empty())
-            {
-                return;
-            }
-        } else if target_full {
-            return;
+        let Some(demanded) = self.wanted else {
+            return false;
+        };
+        // Only once the stepper's destination is the demanded track. While the
+        // head is being walked somewhere -- a recalibration, a long seek -- the
+        // consumer's last demand still names where it used to be, and capturing
+        // there would drag the head back against the journey, over and over.
+        // The next poll for the settled head names both afresh.
+        if demanded != self.target {
+            return false;
+        }
+        let wanted = demanded;
+        let target_full = {
+            let cache = lock(&self.captures);
+            let captures = cache.get(&demanded);
+            let depth = wanted_depth(captures.and_then(VecDeque::back));
+            captures.is_some_and(|captures| captures.len() >= depth)
+        };
+        if target_full {
+            return false;
         }
 
         if let Err(error) = self.position(wanted) {
-            self.disconnect(error);
-            return;
+            self.note_error(error);
+            return false;
         }
-        let capture = match self
-            .device
-            .read_track(self.config.mode, self.config.density)
-        {
+        let publish = Arc::clone(&self.partial);
+        let capture = match self.device.read_track(
+            self.config.mode,
+            self.config.density,
+            &mut |words, bit_len| {
+                *lock(&publish) = Some(PartialCapture {
+                    track: wanted,
+                    words,
+                    bit_len,
+                });
+            },
+        ) {
             Ok(capture) => capture,
-            Err(Error::Timeout(_)) => return,
+            // No index came round: the platter is stopping, spinning up, or
+            // holds no disk. That is a state of the world, not a fault.
+            Err(Error::Timeout(_)) => return false,
             Err(error) => {
-                self.disconnect(error);
-                return;
+                self.note_error(error);
+                return false;
             }
         };
         if let Err(error) = device::validate_capture(&capture) {
-            self.disconnect(error);
-            return;
+            self.note_error(error);
+            return false;
         }
+        // The finished revolution supersedes the partial it grew from.
+        *lock(&self.partial) = None;
+        self.consecutive_errors = 0;
         self.generation = self.generation.wrapping_add(1);
         let quality = if capture.index_aligned {
             CaptureQuality::IndexAligned
@@ -487,7 +676,7 @@ impl Worker {
         let mut cache = lock(&self.captures);
         if cache.len() >= MAX_CACHED_TRACKS
             && !cache.contains_key(&wanted)
-            && let Some(key) = cache.keys().copied().find(|key| *key != self.target)
+            && let Some(key) = cache.keys().copied().find(|key| *key != demanded)
         {
             cache.remove(&key);
         }
@@ -496,6 +685,7 @@ impl Worker {
             captures.pop_front();
         }
         captures.push_back(capture);
+        true
     }
 
     fn refresh_status_if_due(&mut self) {
@@ -515,8 +705,9 @@ impl Worker {
                     });
                 }
                 *lock(&self.status) = new;
+                self.consecutive_errors = 0;
             }
-            Err(error) => self.disconnect(error),
+            Err(error) => self.note_error(error),
         }
     }
 
@@ -524,6 +715,24 @@ impl Worker {
         self.failed = true;
         lock(&self.status).working = false;
         let _ = self.events.try_send(BridgeEvent::Disconnected(error));
+    }
+}
+
+/// How many readings of a track are worth holding, given the newest one.
+///
+/// A reading that cannot be turned under the head twice is consumed and
+/// advanced past, so its successor is stocked ahead: the retry is already in
+/// hand when the consumer asks for it. A replayable reading is kept by the
+/// consumer for as long as it is wanted, and a second would almost always go
+/// unread -- while the capture taking it sat in front of whichever track the
+/// machine asked for next, uninterruptible once begun. Measured over a
+/// Workbench boot, those speculative readings were discarded rather than
+/// served about nineteen times in twenty, at a capture window of dead time
+/// apiece.
+fn wanted_depth(newest: Option<&TrackCapture>) -> usize {
+    match newest {
+        Some(capture) if !capture.quality().reusable() => CAPTURES_PER_TRACK,
+        _ => 1,
     }
 }
 
@@ -595,6 +804,7 @@ mod tests {
             &mut self,
             _mode: ReadMode,
             _density: DensityMode,
+            _progress: &mut dyn FnMut(Vec<u16>, usize),
         ) -> Result<device::RawCapture> {
             Ok(device::RawCapture {
                 words: vec![0xaaaa; 6_250],
@@ -615,7 +825,7 @@ mod tests {
         }
     }
 
-    fn fake_bridge(auto_cache: bool) -> FakeBridge {
+    fn fake_bridge() -> FakeBridge {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let status = DriveStatus {
@@ -635,7 +845,6 @@ mod tests {
         };
         let config = BridgeConfig {
             driver: DriverKind::DrawBridge,
-            auto_cache,
             port: PortSelection::Auto,
             ..BridgeConfig::default()
         };
@@ -650,7 +859,7 @@ mod tests {
 
     #[test]
     fn capture_is_nonblocking_and_eventually_available() {
-        let (mut bridge, _, _) = fake_bridge(false);
+        let (mut bridge, _, _) = fake_bridge();
         let track = TrackAddress::default();
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
@@ -664,8 +873,8 @@ mod tests {
     }
 
     #[test]
-    fn write_restores_target_after_auto_cache_move() {
-        let (mut bridge, writes, _) = fake_bridge(true);
+    fn write_restores_target_after_capture_move() {
+        let (mut bridge, writes, _) = fake_bridge();
         let target = TrackAddress {
             cylinder: 40,
             side: Side::Upper,
@@ -688,7 +897,7 @@ mod tests {
 
     #[test]
     fn first_position_selects_both_coordinates_and_motor_uses_spin_up_delay() {
-        let (mut bridge, _, calls) = fake_bridge(false);
+        let (mut bridge, _, calls) = fake_bridge();
         bridge.set_motor(Side::Lower, true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
@@ -712,15 +921,19 @@ mod tests {
     }
 
     #[test]
-    fn seek_is_coalesced_when_command_queue_is_full() {
-        let (commands, command_rx) = bounded(1);
-        commands.try_send(Command::NoClick(Side::Lower)).unwrap();
+    fn motor_and_seek_are_state_and_survive_any_flood() {
+        let (commands, _command_rx) = bounded(1);
         let (_event_tx, events) = bounded(1);
+        let (nudge_tx, _nudge_rx) = bounded(1);
+        let desired = Arc::new(Mutex::new(Desired::default()));
         let mut bridge = Bridge {
             commands,
             events,
             status: Arc::new(Mutex::new(DriveStatus::default())),
             captures: Arc::new(Mutex::new(HashMap::new())),
+            desired: Arc::clone(&desired),
+            partial: Arc::new(Mutex::new(None)),
+            nudge: nudge_tx,
             selected_port: PortId::new("fake").unwrap(),
             next_write: 1,
             max_cylinders: 80,
@@ -728,17 +941,27 @@ mod tests {
             worker: None,
         };
 
-        assert!(
-            bridge
-                .seek(TrackAddress {
-                    cylinder: 42,
-                    side: Side::Upper,
-                })
-                .is_ok()
+        // A guest expresses these thousands of times a second; none may fail
+        // and only the latest matters.
+        for cylinder in 0..80 {
+            assert!(
+                bridge
+                    .seek(TrackAddress {
+                        cylinder,
+                        side: Side::Upper,
+                    })
+                    .is_ok()
+            );
+            assert!(bridge.set_motor(Side::Lower, cylinder % 2 == 0).is_ok());
+        }
+        let wish = *lock(&desired);
+        assert_eq!(
+            wish.target,
+            Some(TrackAddress {
+                cylinder: 79,
+                side: Side::Upper,
+            })
         );
-        assert!(matches!(
-            command_rx.try_recv(),
-            Ok(Command::NoClick(Side::Lower))
-        ));
+        assert_eq!(wish.motor, Some((Side::Lower, false)));
     }
 }

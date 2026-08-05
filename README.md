@@ -2,106 +2,98 @@
 
 # FluxBridge
 
-FluxBridge is a safe Rust library for reading and writing physical floppy
-drives through DrawBridge, Greaseweazle, and SuperCard Pro interfaces. It
-provides typed discovery and configuration, non-blocking revolution capture,
-and observable asynchronous writes without a C or C++ ABI.
+A Rust library for using a real floppy drive as an emulated machine's drive.
+The emulator asks for tracks; FluxBridge runs the interface hardware on a
+worker thread and hands back decoded MFM revolutions. Reads never block the
+caller, a track can be served while the disk is still turning past the head,
+and writes are queued and reported back when the hardware finishes them.
 
-This project is a Rust port of the active runtime portions of Rob Smith's
-[FloppyDriveBridge][upstream]. The initial port is based on upstream commit
-`710fa15cb200303f8c4bde1c931786175f301a68` and incorporates the Linux/musl
-2 Mbaud correction from [upstream pull request #15][pr15]. See
-[NOTICE.md](NOTICE.md) and [the porting notes](docs/porting.md) for provenance
-and deliberate behavioral changes.
+Written for [Copperline](https://github.com/CopperlineHQ/Copperline), but the
+API has no Copperline types in it and any emulator can use it. The crate is
+pure Rust and forbids unsafe code.
 
-## Status
+## Hardware support
 
-The public API, controller, flux algorithms, and all three device protocols are
-implemented. Protocol and controller behavior is covered by deterministic
-tests; hardware tests are opt-in because they require a physical interface and
-real media. Treat the `0.1` API as young, and report the interface, firmware,
-host OS, and port identifier with hardware issues.
+| Interface | State |
+|---|---|
+| [Greaseweazle](https://github.com/keirf/greaseweazle) | Supported. Tested on real hardware on macOS, Windows, and Linux hosts; tuned for emulator use. Needs main firmware 0.27 or newer. |
+| DrawBridge | Protocol implemented behind the `drawbridge` feature. Not yet tested on hardware. |
+| SuperCard Pro | Protocol implemented behind the `supercard-pro` feature. Not yet tested on hardware. |
 
-## Use
+`drivers()` lists the drivers compiled into a build, so an application's
+interface menu can be built from it rather than hardcoded. Copperline
+enables `greaseweazle` only.
+
+## Design
+
+- Motor and seek requests are latest-wins state, not queued commands. An
+  emulator can send them thousands of times a second; only the newest
+  matters to the mechanism, and none are lost.
+- `read_track` returns `None` until a capture is ready. During an immediate
+  capture, `partial_track` returns the decoded revolution so far, so the
+  consumer can serve the early sectors while the later ones are still under
+  the head.
+- `ReadMode` selects the capture strategy: `Normal` captures immediately
+  without waiting for the index pulse, `Compatible` captures from one index
+  pulse to the next, `Stalling` is index-aligned and may block the caller up
+  to `stall_timeout`.
+- An immediate capture is cut where the recording repeats, and the cut is
+  verified: the pattern must match at several offsets, and the result is
+  also scanned as AmigaDOS structure with checksums. Every capture carries a
+  `CaptureQuality` saying whether it is safe to replay or should be served
+  once and re-read.
+- `DensityMode::Auto` senses DD or HD from the media: DrawBridge asks its
+  firmware, Greaseweazle measures the flux intervals (it has no sense
+  line). The result also sets the density of later `Auto` writes.
+- The head steps at 3 ms, the rate an Amiga steps its own drive.
+- `submit_write` returns a `WriteId`; completion or failure arrives through
+  `poll_event`. Write-protected disks, and writes the hardware cannot place
+  where they were asked for, are refused.
+
+## Example
 
 ```rust,no_run
-use fluxbridge::{
-    Bridge, BridgeConfig, DriverKind, Side, TrackAddress,
-};
+use fluxbridge::{Bridge, BridgeConfig, DriverKind, Side, TrackAddress};
 
-let config = BridgeConfig {
+let mut bridge = Bridge::open(&BridgeConfig {
     driver: DriverKind::Greaseweazle,
     ..BridgeConfig::default()
-};
-let mut bridge = Bridge::open(&config)?;
-let track = TrackAddress {
-    cylinder: 0,
-    side: Side::Lower,
-};
+})?;
+let track = TrackAddress { cylinder: 0, side: Side::Lower };
 
 bridge.set_motor(track.side, true)?;
 bridge.seek(track)?;
 if let Some(capture) = bridge.read_track(track)? {
-    println!(
-        "{} bits, {:?}, reusable={}",
-        capture.bit_len(),
-        capture.quality(),
-        capture.quality().reusable(),
-    );
+    println!("{} bits, {:?}", capture.bit_len(), capture.quality());
 }
 # Ok::<(), fluxbridge::Error>(())
 ```
 
-`ReadMode::Fast` begins immediately and validates the reconstructed overlap.
-`Compatible` captures between index pulses. `Stalling` has compatible capture
-semantics but allows `read_track` to wait for at most the configured
-`stall_timeout`. Writes are accepted with `submit_write`; actual completion or
-failure arrives through `poll_event`.
+## Origin
 
-Port enumeration deliberately does not probe every serial device. Use
-`PortSelection::Auto` to probe candidates suitable for the chosen driver, or
-persist the `PortId` returned by `ports()` and use `PortSelection::Exact`.
-
-## Features
-
-The default features are:
-
-- `drawbridge`
-- `greaseweazle`
-- `supercard-pro`
-- `direct-ftdi`, using the pure-Rust `ftdi-nusb` transport
-
-Disable default features to build only the protocols an application needs.
-The crate itself forbids unsafe Rust. The serial transport disables
-`serialport`'s `libudev` feature, which keeps Linux musl builds self-contained.
-
-## Safety
-
-Reads are non-destructive. Writes alter real media and may be impossible to
-undo. FluxBridge rejects write-protected disks, oversized buffers, inconsistent
-bit lengths, and partial writes that the selected hardware cannot place
-safely. Applications should still require explicit user permission before
-enabling writes and should test with disposable media first.
+FluxBridge started as a Rust port of Rob Smith's
+[FloppyDriveBridge](https://github.com/RobSmithDev/FloppyDriveBridge). The
+device protocols and the PLL come from that port. The controller and capture
+pipeline were then redesigned and no longer follow the original: motor and
+seek handling, capture policy, streaming, and revolution verification all
+work differently. [NOTICE.md](NOTICE.md) records the provenance;
+[docs/porting.md](docs/porting.md) records what was changed and why.
 
 ## Documentation
 
-- [Public API guide](docs/api.md)
-- [Internal architecture](docs/internals.md)
-- [Hardware protocols](docs/protocols.md)
-- [Porting notes and fixed defects](docs/porting.md)
-- [Testing and hardware checks](docs/testing.md)
+[API guide](docs/api.md) · [internals](docs/internals.md) ·
+[protocols](docs/protocols.md) · [porting notes](docs/porting.md) ·
+[testing](docs/testing.md), or `cargo doc --all-features --no-deps`.
 
-API reference can also be generated with `cargo doc --all-features --no-deps`.
+## Acknowledgements
+
+Rob Smith (FloppyDriveBridge), Keir Fraser (Greaseweazle), Jim Drew /
+CBMSTUFF.COM (SuperCard Pro).
 
 ## Licensing
 
-FluxBridge is distributed under `LGPL-3.0-or-later AND MPL-2.0` at the package
-level. Newly written and LGPL-derived modules carry
-`LGPL-3.0-or-later`; modules substantially derived from upstream's
-MPL/GPL-licensed implementation carry
-`MPL-2.0 AND LGPL-3.0-or-later`. The MPL option was selected for the upstream
-portion rather than GPL. SPDX headers identify the terms for each file, and
-complete texts are in [`LICENSES`](LICENSES/).
-
-[upstream]: https://github.com/RobSmithDev/FloppyDriveBridge
-[pr15]: https://github.com/RobSmithDev/FloppyDriveBridge/pull/15
+`LGPL-3.0-or-later AND MPL-2.0`. Newly written and LGPL-derived modules are
+`LGPL-3.0-or-later`; modules derived from FloppyDriveBridge are
+`MPL-2.0 AND LGPL-3.0-or-later` (FloppyDriveBridge is multi-licensed and the
+MPL option was taken). Each file carries an SPDX header; full texts are in
+[`LICENSES`](LICENSES/).
