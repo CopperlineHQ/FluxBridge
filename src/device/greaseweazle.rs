@@ -271,6 +271,11 @@ impl Greaseweazle {
 
     fn read_stream(&mut self, mode: ReadMode) -> Result<RawCapture> {
         self.select(true)?;
+        // Every read carries a tick ceiling as well as an index count: the
+        // index bound ends a healthy read, and the ceiling ends one whose
+        // platter stopped -- a motor switched off mid-capture, or no disk in
+        // the drive. Without it the firmware streams until an index that will
+        // never come, and the worker hangs with it.
         let (ticks, max_index, linger) = if mode == ReadMode::Fast {
             (
                 u32::try_from(u64::from(self.sample_frequency) * 260 / 1_000)
@@ -280,7 +285,8 @@ impl Greaseweazle {
             )
         } else {
             (
-                0,
+                u32::try_from(u64::from(self.sample_frequency) * 2)
+                    .expect("2s tick count fits u32"),
                 2,
                 u32::try_from(u64::from(self.sample_frequency) * 20 / 1_000)
                     .expect("20ms tick count fits u32"),
@@ -290,45 +296,60 @@ impl Greaseweazle {
         header.extend_from_slice(&ticks.to_le_bytes());
         header.extend_from_slice(&max_index.to_le_bytes());
         header.extend_from_slice(&linger.to_le_bytes());
-        self.expect_ok(Command::ReadFlux, &header)?;
 
-        let deadline = Instant::now() + STREAM_TIMEOUT;
-        let mut stream = Vec::with_capacity(128 * 1024);
+        // An overflow is the host falling behind the stream for a moment --
+        // scheduling weather, not a fault of the disk -- so it is worth a
+        // fresh revolution before it is reported. Upstream FloppyDriveBridge
+        // retries these five deep; a couple is enough with a purged pipe.
+        let mut stream = Vec::new();
+        let mut attempt = 0_u32;
         loop {
-            if stream.len() >= MAX_STREAM_BYTES {
-                return Err(Error::TrackTooLarge {
-                    bits: stream.len() * 8,
-                    limit: MAX_STREAM_BYTES * 8,
-                });
+            attempt += 1;
+            self.expect_ok(Command::ReadFlux, &header)?;
+
+            let deadline = Instant::now() + STREAM_TIMEOUT;
+            stream.clear();
+            stream.reserve(128 * 1024);
+            loop {
+                if stream.len() >= MAX_STREAM_BYTES {
+                    return Err(Error::TrackTooLarge {
+                        bits: stream.len() * 8,
+                        limit: MAX_STREAM_BYTES * 8,
+                    });
+                }
+                let mut byte = [0_u8];
+                read_exact_until(
+                    self.transport.as_mut(),
+                    &mut byte,
+                    deadline,
+                    "Greaseweazle flux stream",
+                )?;
+                if byte[0] == 0 {
+                    break;
+                }
+                stream.push(byte[0]);
             }
-            let mut byte = [0_u8];
-            read_exact_until(
-                self.transport.as_mut(),
-                &mut byte,
-                deadline,
-                "Greaseweazle flux stream",
-            )?;
-            if byte[0] == 0 {
-                break;
+            let status = self.raw_command_ack(Command::GetFluxStatus, &[])?;
+            match status {
+                ACK_OK => {
+                    self.status.disk_present = true;
+                    self.status.ready = true;
+                    break;
+                }
+                ACK_NO_INDEX => {
+                    self.status.disk_present = false;
+                    return Err(Error::Timeout("Greaseweazle index pulse"));
+                }
+                ACK_FLUX_OVERFLOW if attempt < 3 => {
+                    self.transport.purge()?;
+                }
+                ACK_FLUX_OVERFLOW => {
+                    return Err(Error::Protocol(
+                        "Greaseweazle flux receive buffer overflowed".into(),
+                    ));
+                }
+                other => map_ack(Command::GetFluxStatus, other)?,
             }
-            stream.push(byte[0]);
-        }
-        let status = self.raw_command_ack(Command::GetFluxStatus, &[])?;
-        match status {
-            ACK_OK => {
-                self.status.disk_present = true;
-                self.status.ready = true;
-            }
-            ACK_NO_INDEX => {
-                self.status.disk_present = false;
-                return Err(Error::Timeout("Greaseweazle index pulse"));
-            }
-            ACK_FLUX_OVERFLOW => {
-                return Err(Error::Protocol(
-                    "Greaseweazle flux receive buffer overflowed".into(),
-                ));
-            }
-            other => map_ack(Command::GetFluxStatus, other)?,
         }
         if !self.status.motor_running {
             self.select(false)?;

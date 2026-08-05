@@ -23,13 +23,32 @@ const MAX_CACHED_TRACKS: usize = 8;
 const INDEX_WRITE_SLACK_BITS: usize = 30;
 
 enum Command {
-    Motor { side: crate::Side, enabled: bool },
-    Seek(TrackAddress),
     NoClick(crate::Side),
-    Advance(TrackAddress),
     Write { id: WriteId, request: WriteRequest },
     Shutdown,
 }
+
+/// The caller's latest wish for the mechanism, overwritten rather than queued.
+///
+/// An emulated machine expresses motor and head state thousands of times a
+/// second -- every guest step pulse, every CIA motor write, every poll for the
+/// track under the head. Queuing those as commands replays the machine's whole
+/// journey against a device that can only move so fast, and a full queue loses
+/// whichever command arrives next; the loss of a motor transition leaves the
+/// worker's view of the drive permanently wrong. Only the *latest* state can
+/// matter to a physical mechanism, so that is all this keeps.
+#[derive(Default, Clone, Copy)]
+struct Desired {
+    motor: Option<(crate::Side, bool)>,
+    target: Option<TrackAddress>,
+}
+
+/// Consecutive device errors after which the drive is declared lost.
+///
+/// A spinning mechanism has weather -- an overflowed capture, a read racing a
+/// motor toggle -- and a single failure says nothing. A cable that has been
+/// pulled fails every time, which is what this distinguishes.
+const MAX_CONSECUTIVE_ERRORS: u32 = 20;
 
 type CaptureCache = HashMap<TrackAddress, VecDeque<TrackCapture>>;
 
@@ -43,6 +62,7 @@ pub struct Bridge {
     events: Receiver<BridgeEvent>,
     status: Arc<Mutex<DriveStatus>>,
     captures: Arc<Mutex<CaptureCache>>,
+    desired: Arc<Mutex<Desired>>,
     selected_port: PortId,
     next_write: u64,
     max_cylinders: u8,
@@ -74,8 +94,10 @@ impl Bridge {
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let status = Arc::new(Mutex::new(initial_status));
         let captures = Arc::new(Mutex::new(HashMap::new()));
+        let desired = Arc::new(Mutex::new(Desired::default()));
         let worker_status = Arc::clone(&status);
         let worker_captures = Arc::clone(&captures);
+        let worker_desired = Arc::clone(&desired);
         let stall_timeout = (config.mode == ReadMode::Stalling).then_some(config.stall_timeout);
         let worker = thread::Builder::new()
             .name(format!("fluxbridge-{}", config.driver))
@@ -87,6 +109,7 @@ impl Bridge {
                     event_tx,
                     worker_status,
                     worker_captures,
+                    worker_desired,
                 )
                 .run();
             })
@@ -97,6 +120,7 @@ impl Bridge {
             events: event_rx,
             status,
             captures,
+            desired,
             selected_port,
             next_write: 1,
             max_cylinders: initial_status.max_cylinders,
@@ -115,21 +139,25 @@ impl Bridge {
         *lock(&self.status)
     }
 
-    /// Enqueues a motor transition.
+    /// Records the desired motor state, applied by the worker as its next act.
+    ///
+    /// State rather than a command: an emulated machine toggles the motor as
+    /// often as its guest pleases, and only the latest wish can matter to a
+    /// physical spindle. Cannot fail and cannot be lost.
     pub fn set_motor(&mut self, side: crate::Side, enabled: bool) -> Result<()> {
-        self.enqueue(Command::Motor { side, enabled })
+        lock(&self.desired).motor = Some((side, enabled));
+        Ok(())
     }
 
-    /// Enqueues a seek and side selection, clamped to the physical mechanism.
+    /// Records where the head should be, clamped to the physical mechanism.
     ///
-    /// If the bounded queue is already full, the request is coalesced: callers
-    /// may name the desired track again on their next read without turning
-    /// repeated step or side signals into a hard failure.
+    /// State rather than a command, so a guest stepping every three
+    /// milliseconds steers the head without replaying its whole journey: the
+    /// worker moves to wherever the head belongs *now*, not through every
+    /// cylinder it was ever asked for on the way.
     pub fn seek(&mut self, track: TrackAddress) -> Result<()> {
-        self.enqueue_coalescing(Command::Seek(device::clamp_track(
-            track,
-            self.max_cylinders,
-        )))
+        lock(&self.desired).target = Some(device::clamp_track(track, self.max_cylinders));
+        Ok(())
     }
 
     /// Requests the no-click step used by track-zero disk-change detection.
@@ -140,7 +168,7 @@ impl Bridge {
     /// Returns the newest completed capture for a track, if one is ready.
     pub fn read_track(&mut self, track: TrackAddress) -> Result<Option<TrackCapture>> {
         let track = device::clamp_track(track, self.max_cylinders);
-        self.enqueue_coalescing(Command::Seek(track))?;
+        lock(&self.desired).target = Some(track);
         let capture = || {
             lock(&self.captures)
                 .get(&track)
@@ -171,7 +199,10 @@ impl Bridge {
         if let Some(captures) = lock(&self.captures).get_mut(&track) {
             captures.pop_front();
         }
-        self.enqueue_coalescing(Command::Advance(track))
+        // The worker refills any track below its capture depth on its own;
+        // naming the track keeps the head there while it does.
+        lock(&self.desired).target = Some(track);
+        Ok(())
     }
 
     /// Accepts a validated asynchronous write and returns its identifier.
@@ -242,13 +273,6 @@ impl Bridge {
                 TrySendError::Disconnected(_) => Error::WorkerStopped,
             })
     }
-
-    fn enqueue_coalescing(&self, command: Command) -> Result<()> {
-        match self.commands.try_send(command) {
-            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
-            Err(TrySendError::Disconnected(_)) => Err(Error::WorkerStopped),
-        }
-    }
 }
 
 impl Drop for Bridge {
@@ -277,10 +301,15 @@ struct Worker {
     events: Sender<BridgeEvent>,
     status: Arc<Mutex<DriveStatus>>,
     captures: Arc<Mutex<CaptureCache>>,
+    desired: Arc<Mutex<Desired>>,
     target: TrackAddress,
     physical: TrackAddress,
     positioned: bool,
     failed: bool,
+    /// Device errors since the last success. A mechanism mid-spin produces
+    /// occasional weather; only an unbroken run of failures means the drive is
+    /// really gone.
+    consecutive_errors: u32,
     generation: u64,
     next_status: Instant,
     cache_cursor: u8,
@@ -294,6 +323,7 @@ impl Worker {
         events: Sender<BridgeEvent>,
         status: Arc<Mutex<DriveStatus>>,
         captures: Arc<Mutex<CaptureCache>>,
+        desired: Arc<Mutex<Desired>>,
     ) -> Self {
         Self {
             config,
@@ -302,10 +332,12 @@ impl Worker {
             events,
             status,
             captures,
+            desired,
             target: TrackAddress::default(),
             physical: TrackAddress::default(),
             positioned: false,
             failed: false,
+            consecutive_errors: 0,
             generation: 0,
             next_status: Instant::now(),
             cache_cursor: 0,
@@ -332,6 +364,10 @@ impl Worker {
             if shutdown {
                 break;
             }
+            self.apply_desired();
+            if self.failed {
+                break;
+            }
             self.refresh_status_if_due();
             if self.failed {
                 break;
@@ -347,17 +383,6 @@ impl Worker {
 
     fn process(&mut self, command: Command) -> bool {
         let result = match command {
-            Command::Motor { side, enabled } => self
-                .position(TrackAddress {
-                    cylinder: self.target.cylinder,
-                    side,
-                })
-                .and_then(|()| self.device.set_motor(enabled, false))
-                .map(|()| lock(&self.status).motor_running = enabled),
-            Command::Seek(track) | Command::Advance(track) => {
-                self.target = track;
-                self.position(track)
-            }
             Command::NoClick(side) => self
                 .device
                 .select_side(side)
@@ -369,10 +394,55 @@ impl Worker {
             Command::Shutdown => return true,
         };
         if let Err(error) = result {
-            self.disconnect(error);
-            return true;
+            self.note_error(error);
         }
-        false
+        self.failed
+    }
+
+    /// Applies the caller's latest motor and head wishes.
+    ///
+    /// Runs at the top of every loop, so a capture is only ever begun with the
+    /// freshest view of what the machine wants -- a motor turned off between
+    /// loops is seen before the next read would have spun against it.
+    fn apply_desired(&mut self) {
+        let wish = {
+            let mut desired = lock(&self.desired);
+            Desired {
+                motor: desired.motor.take(),
+                target: desired.target.take(),
+            }
+        };
+        if let Some(track) = wish.target {
+            self.target = track;
+            if let Err(error) = self.position(track) {
+                self.note_error(error);
+                return;
+            }
+            self.consecutive_errors = 0;
+        }
+        if let Some((side, enabled)) = wish.motor {
+            let result = self
+                .position(TrackAddress {
+                    cylinder: self.target.cylinder,
+                    side,
+                })
+                .and_then(|()| self.device.set_motor(enabled, false))
+                .map(|()| lock(&self.status).motor_running = enabled);
+            match result {
+                Ok(()) => self.consecutive_errors = 0,
+                Err(error) => self.note_error(error),
+            }
+        }
+    }
+
+    /// Counts a device error, declaring the drive lost only when errors run
+    /// unbroken or the device is positively gone.
+    fn note_error(&mut self, error: Error) {
+        self.consecutive_errors += 1;
+        let fatal = matches!(error, Error::Disconnected | Error::WorkerStopped);
+        if fatal || self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+            self.disconnect(error);
+        }
     }
 
     fn position(&mut self, track: TrackAddress) -> Result<()> {
@@ -452,7 +522,7 @@ impl Worker {
         }
 
         if let Err(error) = self.position(wanted) {
-            self.disconnect(error);
+            self.note_error(error);
             return;
         }
         let capture = match self
@@ -460,16 +530,19 @@ impl Worker {
             .read_track(self.config.mode, self.config.density)
         {
             Ok(capture) => capture,
+            // No index came round: the platter is stopping, spinning up, or
+            // holds no disk. That is a state of the world, not a fault.
             Err(Error::Timeout(_)) => return,
             Err(error) => {
-                self.disconnect(error);
+                self.note_error(error);
                 return;
             }
         };
         if let Err(error) = device::validate_capture(&capture) {
-            self.disconnect(error);
+            self.note_error(error);
             return;
         }
+        self.consecutive_errors = 0;
         self.generation = self.generation.wrapping_add(1);
         let quality = if capture.index_aligned {
             CaptureQuality::IndexAligned
@@ -515,8 +588,9 @@ impl Worker {
                     });
                 }
                 *lock(&self.status) = new;
+                self.consecutive_errors = 0;
             }
-            Err(error) => self.disconnect(error),
+            Err(error) => self.note_error(error),
         }
     }
 
@@ -712,15 +786,16 @@ mod tests {
     }
 
     #[test]
-    fn seek_is_coalesced_when_command_queue_is_full() {
-        let (commands, command_rx) = bounded(1);
-        commands.try_send(Command::NoClick(Side::Lower)).unwrap();
+    fn motor_and_seek_are_state_and_survive_any_flood() {
+        let (commands, _command_rx) = bounded(1);
         let (_event_tx, events) = bounded(1);
+        let desired = Arc::new(Mutex::new(Desired::default()));
         let mut bridge = Bridge {
             commands,
             events,
             status: Arc::new(Mutex::new(DriveStatus::default())),
             captures: Arc::new(Mutex::new(HashMap::new())),
+            desired: Arc::clone(&desired),
             selected_port: PortId::new("fake").unwrap(),
             next_write: 1,
             max_cylinders: 80,
@@ -728,17 +803,27 @@ mod tests {
             worker: None,
         };
 
-        assert!(
-            bridge
-                .seek(TrackAddress {
-                    cylinder: 42,
-                    side: Side::Upper,
-                })
-                .is_ok()
+        // A guest expresses these thousands of times a second; none may fail
+        // and only the latest matters.
+        for cylinder in 0..80 {
+            assert!(
+                bridge
+                    .seek(TrackAddress {
+                        cylinder,
+                        side: Side::Upper,
+                    })
+                    .is_ok()
+            );
+            assert!(bridge.set_motor(Side::Lower, cylinder % 2 == 0).is_ok());
+        }
+        let wish = *lock(&desired);
+        assert_eq!(
+            wish.target,
+            Some(TrackAddress {
+                cylinder: 79,
+                side: Side::Upper,
+            })
         );
-        assert!(matches!(
-            command_rx.try_recv(),
-            Ok(Command::NoClick(Side::Lower))
-        ));
+        assert_eq!(wish.motor, Some((Side::Lower, false)));
     }
 }
