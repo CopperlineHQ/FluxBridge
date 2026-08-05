@@ -29,13 +29,20 @@ environment are provided:
 ```text
 FLUXBRIDGE_TEST_DRIVER=greaseweazle \
 FLUXBRIDGE_TEST_PORT=/dev/ttyACM0 \
+FLUXBRIDGE_TEST_DRIVE=pc-a \
 cargo test --features hardware-tests -- --ignored --nocapture
 ```
 
 Inventory and read probes do not alter media. A write probe must additionally
 set `FLUXBRIDGE_TEST_WRITE=1`; use only a disposable disk. Hardware tests never
-fall back from the requested driver or port.
+fall back from the requested driver, port, or drive-select line. Supported
+drive tokens are `pc-a`, `pc-b`, and `shugart-0` through `shugart-3`; the
+default is `pc-a`.
 
-No physical interface was available during the initial port. Passing CI proves
-the controller and protocol transcripts, not electrical compatibility with
-every firmware/hardware combination.
+The Greaseweazle path has also been validated on physical hardware: a
+Greaseweazle attached to a Shugart-select-0 PC drive captured both sides at
+cylinders 0, 1, 40, and 79 from an AmigaTestKit DD disk. Every sampled
+revolution decoded as 11 clean AmigaDOS sectors, and Copperline booted the disk
+through its Paula bitstream path under Kickstart 1.3. Passing CI still proves
+controller and protocol behaviour rather than electrical compatibility with
+every firmware and drive combination.

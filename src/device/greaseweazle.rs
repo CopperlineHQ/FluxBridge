@@ -37,6 +37,48 @@ enum Command {
     NoClickStep = 22,
 }
 
+impl Command {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::GetInfo => "GetInfo",
+            Self::Seek => "Seek",
+            Self::Head => "Head",
+            Self::SetParams => "SetParams",
+            Self::GetParams => "GetParams",
+            Self::Motor => "Motor",
+            Self::ReadFlux => "ReadFlux",
+            Self::WriteFlux => "WriteFlux",
+            Self::GetFluxStatus => "GetFluxStatus",
+            Self::Select => "Select",
+            Self::Deselect => "Deselect",
+            Self::SetBusType => "SetBusType",
+            Self::Reset => "Reset",
+            Self::GetPin => "GetPin",
+            Self::NoClickStep => "NoClickStep",
+        }
+    }
+
+    const fn acknowledgement_operation(self) -> &'static str {
+        match self {
+            Self::GetInfo => "Greaseweazle GetInfo acknowledgement",
+            Self::Seek => "Greaseweazle Seek acknowledgement",
+            Self::Head => "Greaseweazle Head acknowledgement",
+            Self::SetParams => "Greaseweazle SetParams acknowledgement",
+            Self::GetParams => "Greaseweazle GetParams acknowledgement",
+            Self::Motor => "Greaseweazle Motor acknowledgement",
+            Self::ReadFlux => "Greaseweazle ReadFlux acknowledgement",
+            Self::WriteFlux => "Greaseweazle WriteFlux acknowledgement",
+            Self::GetFluxStatus => "Greaseweazle GetFluxStatus acknowledgement",
+            Self::Select => "Greaseweazle Select acknowledgement",
+            Self::Deselect => "Greaseweazle Deselect acknowledgement",
+            Self::SetBusType => "Greaseweazle SetBusType acknowledgement",
+            Self::Reset => "Greaseweazle Reset acknowledgement",
+            Self::GetPin => "Greaseweazle GetPin acknowledgement",
+            Self::NoClickStep => "Greaseweazle NoClickStep acknowledgement",
+        }
+    }
+}
+
 const ACK_OK: u8 = 0;
 const ACK_BAD_COMMAND: u8 = 1;
 const ACK_NO_INDEX: u8 = 2;
@@ -75,7 +117,7 @@ impl Greaseweazle {
             selected: false,
             high_density: config.density == DensityMode::High,
         };
-        device.transport.purge()?;
+        device.prepare_transport()?;
 
         let version = device.get_firmware().or_else(|_| {
             device.transport.purge()?;
@@ -102,7 +144,7 @@ impl Greaseweazle {
         }
 
         device.command(Command::Reset, &[], 0)?;
-        let delay_bytes = device.command(Command::GetParams, &[0], 10)?;
+        let delay_bytes = device.command(Command::GetParams, &[0, 10], 10)?;
         for (index, chunk) in delay_bytes.chunks_exact(2).enumerate() {
             device.delays[index] = u16::from_le_bytes([chunk[0], chunk[1]]);
         }
@@ -117,17 +159,14 @@ impl Greaseweazle {
         self.command(Command::GetInfo, &[0], 32)
     }
 
+    fn prepare_transport(&mut self) -> Result<()> {
+        self.transport.set_dtr(true)?;
+        self.transport.set_rts(true)?;
+        self.transport.purge()
+    }
+
     fn command(&mut self, command: Command, parameters: &[u8], extra: u8) -> Result<Vec<u8>> {
-        let mut packet = Vec::with_capacity(parameters.len() + 3);
-        packet.push(command as u8);
-        packet.push(
-            u8::try_from(2 + parameters.len() + usize::from(extra > 0))
-                .map_err(|_| Error::InvalidConfig("Greaseweazle command too long".into()))?,
-        );
-        packet.extend_from_slice(parameters);
-        if extra > 0 {
-            packet.push(extra);
-        }
+        let packet = command_packet(command, parameters)?;
         let deadline = operation_deadline();
         write_all_until(
             self.transport.as_mut(),
@@ -140,7 +179,7 @@ impl Greaseweazle {
             self.transport.as_mut(),
             &mut response,
             deadline,
-            "Greaseweazle acknowledgement",
+            command.acknowledgement_operation(),
         )?;
         if response[0] != command as u8 {
             return Err(Error::Protocol(format!(
@@ -148,7 +187,7 @@ impl Greaseweazle {
                 response[0], command as u8
             )));
         }
-        map_ack(response[1])?;
+        map_ack(command, response[1])?;
         let mut output = vec![0; usize::from(extra)];
         if !output.is_empty() {
             read_exact_until(
@@ -186,6 +225,12 @@ impl Greaseweazle {
         if self.bus == 1 {
             let disk_change = self.command(Command::GetPin, &[34], 1)?;
             self.status.disk_present = disk_change[0] == 1;
+        } else {
+            // Shugart pin 2 cannot be sampled by Greaseweazle. Treat media as
+            // present so a read can determine whether flux and index pulses
+            // actually exist; disk-change notification is necessarily
+            // simulated for this bus type.
+            self.status.disk_present = true;
         }
         if deselect {
             self.select(false)?;
@@ -261,7 +306,7 @@ impl Greaseweazle {
                     "Greaseweazle flux receive buffer overflowed".into(),
                 ));
             }
-            other => map_ack(other)?,
+            other => map_ack(Command::GetFluxStatus, other)?,
         }
         if !self.status.motor_running {
             self.select(false)?;
@@ -285,13 +330,7 @@ impl Greaseweazle {
     }
 
     fn raw_command_ack(&mut self, command: Command, parameters: &[u8]) -> Result<u8> {
-        let mut packet = Vec::with_capacity(parameters.len() + 2);
-        packet.push(command as u8);
-        packet.push(
-            u8::try_from(parameters.len() + 2)
-                .map_err(|_| Error::InvalidConfig("Greaseweazle command too long".into()))?,
-        );
-        packet.extend_from_slice(parameters);
+        let packet = command_packet(command, parameters)?;
         let deadline = operation_deadline();
         write_all_until(
             self.transport.as_mut(),
@@ -304,7 +343,7 @@ impl Greaseweazle {
             self.transport.as_mut(),
             &mut response,
             deadline,
-            "Greaseweazle acknowledgement",
+            command.acknowledgement_operation(),
         )?;
         if response[0] != command as u8 {
             return Err(Error::Protocol(
@@ -335,7 +374,7 @@ impl Greaseweazle {
         match ack {
             ACK_OK => {}
             ACK_WRITE_PROTECTED => return Err(Error::WriteProtected),
-            other => map_ack(other)?,
+            other => map_ack(Command::WriteFlux, other)?,
         }
         let deadline = Instant::now() + STREAM_TIMEOUT;
         write_all_until(
@@ -358,11 +397,22 @@ impl Greaseweazle {
                 "Greaseweazle flux transmit buffer underflowed".into(),
             )),
             other => {
-                map_ack(other)?;
+                map_ack(Command::GetFluxStatus, other)?;
                 Ok(())
             }
         }
     }
+}
+
+fn command_packet(command: Command, parameters: &[u8]) -> Result<Vec<u8>> {
+    let mut packet = Vec::with_capacity(parameters.len() + 2);
+    packet.push(command as u8);
+    packet.push(
+        u8::try_from(parameters.len() + 2)
+            .map_err(|_| Error::InvalidConfig("Greaseweazle command too long".into()))?,
+    );
+    packet.extend_from_slice(parameters);
+    Ok(packet)
 }
 
 impl Device for Greaseweazle {
@@ -448,12 +498,13 @@ impl Drop for Greaseweazle {
     }
 }
 
-fn map_ack(ack: u8) -> Result<()> {
+fn map_ack(command: Command, ack: u8) -> Result<()> {
     match ack {
         ACK_OK => Ok(()),
-        ACK_BAD_COMMAND => Err(Error::Protocol(
-            "Greaseweazle rejected an unsupported command".into(),
-        )),
+        ACK_BAD_COMMAND => Err(Error::Protocol(format!(
+            "Greaseweazle rejected unsupported or malformed {} command",
+            command.name()
+        ))),
         ACK_NO_INDEX => Err(Error::Timeout("Greaseweazle index pulse")),
         ACK_WRITE_PROTECTED => Err(Error::WriteProtected),
         ACK_FLUX_OVERFLOW => Err(Error::Protocol("Greaseweazle flux overflow".into())),
@@ -554,6 +605,18 @@ fn encode_ticks(ticks: u32, output: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_length_covers_only_request_bytes() {
+        assert_eq!(
+            command_packet(Command::GetInfo, &[0]).unwrap(),
+            [Command::GetInfo as u8, 3, 0]
+        );
+        assert_eq!(
+            command_packet(Command::GetParams, &[0]).unwrap(),
+            [Command::GetParams as u8, 3, 0]
+        );
+    }
 
     #[test]
     fn flux_tick_forms_decode() {

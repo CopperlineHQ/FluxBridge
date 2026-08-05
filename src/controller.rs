@@ -121,8 +121,12 @@ impl Bridge {
     }
 
     /// Enqueues a seek and side selection, clamped to the physical mechanism.
+    ///
+    /// If the bounded queue is already full, the request is coalesced: callers
+    /// may name the desired track again on their next read without turning
+    /// repeated step or side signals into a hard failure.
     pub fn seek(&mut self, track: TrackAddress) -> Result<()> {
-        self.enqueue(Command::Seek(device::clamp_track(
+        self.enqueue_coalescing(Command::Seek(device::clamp_track(
             track,
             self.max_cylinders,
         )))
@@ -275,6 +279,8 @@ struct Worker {
     captures: Arc<Mutex<CaptureCache>>,
     target: TrackAddress,
     physical: TrackAddress,
+    positioned: bool,
+    failed: bool,
     generation: u64,
     next_status: Instant,
     cache_cursor: u8,
@@ -298,6 +304,8 @@ impl Worker {
             captures,
             target: TrackAddress::default(),
             physical: TrackAddress::default(),
+            positioned: false,
+            failed: false,
             generation: 0,
             next_status: Instant::now(),
             cache_cursor: 0,
@@ -325,7 +333,13 @@ impl Worker {
                 break;
             }
             self.refresh_status_if_due();
+            if self.failed {
+                break;
+            }
             self.capture_if_needed();
+            if self.failed {
+                break;
+            }
         }
         let _ = self.device.set_motor(false, true);
         lock(&self.status).working = false;
@@ -338,7 +352,7 @@ impl Worker {
                     cylinder: self.target.cylinder,
                     side,
                 })
-                .and_then(|()| self.device.set_motor(enabled, true))
+                .and_then(|()| self.device.set_motor(enabled, false))
                 .map(|()| lock(&self.status).motor_running = enabled),
             Command::Seek(track) | Command::Advance(track) => {
                 self.target = track;
@@ -356,19 +370,21 @@ impl Worker {
         };
         if let Err(error) = result {
             self.disconnect(error);
+            return true;
         }
         false
     }
 
     fn position(&mut self, track: TrackAddress) -> Result<()> {
-        if self.physical.cylinder != track.cylinder {
+        if !self.positioned || self.physical.cylinder != track.cylinder {
             self.device.seek(track.cylinder)?;
             self.physical.cylinder = track.cylinder;
         }
-        if self.physical.side != track.side {
+        if !self.positioned || self.physical.side != track.side {
             self.device.select_side(track.side)?;
             self.physical.side = track.side;
         }
+        self.positioned = true;
         let mut status = lock(&self.status);
         status.cylinder = self.physical.cylinder;
         status.side = self.physical.side;
@@ -435,7 +451,8 @@ impl Worker {
             return;
         }
 
-        if self.position(wanted).is_err() {
+        if let Err(error) = self.position(wanted) {
+            self.disconnect(error);
             return;
         }
         let capture = match self
@@ -504,14 +521,9 @@ impl Worker {
     }
 
     fn disconnect(&mut self, error: Error) {
-        let kind = error.kind();
+        self.failed = true;
         lock(&self.status).working = false;
-        if matches!(
-            kind,
-            crate::ErrorKind::Disconnected | crate::ErrorKind::WorkerStopped
-        ) {
-            let _ = self.events.try_send(BridgeEvent::Disconnected(error));
-        }
+        let _ = self.events.try_send(BridgeEvent::Disconnected(error));
     }
 }
 
@@ -531,7 +543,21 @@ mod tests {
         status: DriveStatus,
         physical: TrackAddress,
         writes: Arc<Mutex<Vec<TrackAddress>>>,
+        calls: Arc<Mutex<Vec<DeviceCall>>>,
     }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DeviceCall {
+        Motor { enabled: bool, quick: bool },
+        Seek(u8),
+        Side(Side),
+    }
+
+    type FakeBridge = (
+        Bridge,
+        Arc<Mutex<Vec<TrackAddress>>>,
+        Arc<Mutex<Vec<DeviceCall>>>,
+    );
 
     impl Device for FakeDevice {
         fn selected_port(&self) -> &PortId {
@@ -542,18 +568,21 @@ mod tests {
             Ok(self.status)
         }
 
-        fn set_motor(&mut self, enabled: bool, _quick: bool) -> Result<()> {
+        fn set_motor(&mut self, enabled: bool, quick: bool) -> Result<()> {
+            lock(&self.calls).push(DeviceCall::Motor { enabled, quick });
             self.status.motor_running = enabled;
             self.status.ready = enabled;
             Ok(())
         }
 
         fn seek(&mut self, cylinder: u8) -> Result<()> {
+            lock(&self.calls).push(DeviceCall::Seek(cylinder));
             self.physical.cylinder = cylinder;
             Ok(())
         }
 
         fn select_side(&mut self, side: Side) -> Result<()> {
+            lock(&self.calls).push(DeviceCall::Side(side));
             self.physical.side = side;
             Ok(())
         }
@@ -586,8 +615,9 @@ mod tests {
         }
     }
 
-    fn fake_bridge(auto_cache: bool) -> (Bridge, Arc<Mutex<Vec<TrackAddress>>>) {
+    fn fake_bridge(auto_cache: bool) -> FakeBridge {
         let writes = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
         let status = DriveStatus {
             ready: true,
             disk_present: true,
@@ -601,6 +631,7 @@ mod tests {
             status,
             physical: TrackAddress::default(),
             writes: Arc::clone(&writes),
+            calls: Arc::clone(&calls),
         };
         let config = BridgeConfig {
             driver: DriverKind::DrawBridge,
@@ -608,20 +639,18 @@ mod tests {
             port: PortSelection::Auto,
             ..BridgeConfig::default()
         };
-        (
-            Bridge::from_device(
-                config,
-                Box::new(device),
-                status,
-                PortId::new("fake").unwrap(),
-            ),
-            writes,
-        )
+        let bridge = Bridge::from_device(
+            config,
+            Box::new(device),
+            status,
+            PortId::new("fake").unwrap(),
+        );
+        (bridge, writes, calls)
     }
 
     #[test]
     fn capture_is_nonblocking_and_eventually_available() {
-        let (mut bridge, _) = fake_bridge(false);
+        let (mut bridge, _, _) = fake_bridge(false);
         let track = TrackAddress::default();
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
@@ -636,7 +665,7 @@ mod tests {
 
     #[test]
     fn write_restores_target_after_auto_cache_move() {
-        let (mut bridge, writes) = fake_bridge(true);
+        let (mut bridge, writes, _) = fake_bridge(true);
         let target = TrackAddress {
             cylinder: 40,
             side: Side::Upper,
@@ -655,5 +684,61 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(lock(&writes)[0], target);
+    }
+
+    #[test]
+    fn first_position_selects_both_coordinates_and_motor_uses_spin_up_delay() {
+        let (mut bridge, _, calls) = fake_bridge(false);
+        bridge.set_motor(Side::Lower, true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let calls = lock(&calls);
+            if calls
+                .iter()
+                .any(|call| matches!(call, DeviceCall::Motor { enabled: true, .. }))
+            {
+                assert!(calls.contains(&DeviceCall::Seek(0)));
+                assert!(calls.contains(&DeviceCall::Side(Side::Lower)));
+                assert!(calls.contains(&DeviceCall::Motor {
+                    enabled: true,
+                    quick: false,
+                }));
+                break;
+            }
+            drop(calls);
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn seek_is_coalesced_when_command_queue_is_full() {
+        let (commands, command_rx) = bounded(1);
+        commands.try_send(Command::NoClick(Side::Lower)).unwrap();
+        let (_event_tx, events) = bounded(1);
+        let mut bridge = Bridge {
+            commands,
+            events,
+            status: Arc::new(Mutex::new(DriveStatus::default())),
+            captures: Arc::new(Mutex::new(HashMap::new())),
+            selected_port: PortId::new("fake").unwrap(),
+            next_write: 1,
+            max_cylinders: 80,
+            stall_timeout: None,
+            worker: None,
+        };
+
+        assert!(
+            bridge
+                .seek(TrackAddress {
+                    cylinder: 42,
+                    side: Side::Upper,
+                })
+                .is_ok()
+        );
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(Command::NoClick(Side::Lower))
+        ));
     }
 }

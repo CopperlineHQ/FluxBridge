@@ -32,8 +32,10 @@ health, readiness, media and write-protect state, motor state, physical
 position, mechanism type, and cylinder limit.
 
 `set_motor`, `seek`, and `no_click_step` enqueue bounded commands. The requested
-cylinder is clamped to the physical mechanism. Commands may return a queue-full
-or worker-stopped error, but never wait for a serial transaction.
+cylinder is clamped to the physical mechanism. A seek is coalesced when the
+queue is full because a following read names the desired track again. Other
+commands may return a queue-full or worker-stopped error, but never wait for a
+serial transaction.
 
 ## Captures
 

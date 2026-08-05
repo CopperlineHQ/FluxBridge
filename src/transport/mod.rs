@@ -156,6 +156,7 @@ mod serial {
         // method is therefore unnecessary and is not available on Windows.
         let port = serialport::new(id.as_str(), baud)
             .timeout(timeout)
+            .dtr_on_open(true)
             .open()
             .map_err(map_error)?;
         Ok(Box::new(SerialTransport(port)))
