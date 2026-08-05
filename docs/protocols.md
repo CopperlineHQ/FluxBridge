@@ -20,12 +20,23 @@ Direct FTDI identifiers use `ftdi-nusb`; no proprietary D2XX library is loaded.
 Greaseweazle uses its framed command protocol at 9,600 baud and requires main
 firmware 0.27 or newer. Opening reads the 32-byte firmware record, resets the
 board, reads drive delays, selects IBM PC or Shugart bus mode, and verifies pin
-support.
+support. The head-step interval is set to 3 ms -- the rate an Amiga's own
+stepper runs at -- in place of the interface's 10 ms default. Disk change is
+sampled from pin 34 on the IBM PC bus; the Shugart bus cannot sample it, so
+media is presumed present there and change detection is simulated.
 
 Flux opcodes and compact intervals are converted with the firmware-reported
-sample clock. Reads and disk probes have hard deadlines. Motor-enable failures,
-missing index pulses, overflow, underflow, and write protection are propagated
-rather than converted to success.
+sample clock. Immediate reads capture a fixed 232 ms window with no index
+bound and decode it incrementally, publishing the track-so-far after each
+received chunk; index-aligned reads bound the capture by index count and by a
+tick ceiling, so a platter that stops mid-capture ends the read instead of
+hanging it. `DensityMode::Auto` measures the raw intervals of each capture to
+decide density, since the hardware has no sense line. Reads and disk probes
+have hard deadlines. Motor-enable failures, missing index pulses, overflow,
+underflow, and write protection are propagated rather than converted to
+success; a flux-buffer overflow is retried over a purged pipe before it is
+reported, since it is host scheduling weather rather than a fault of the
+disk.
 
 ## SuperCard Pro
 

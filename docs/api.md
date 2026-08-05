@@ -16,10 +16,10 @@ necessarily been identified as a floppy interface.
 ## Configuration and opening
 
 `BridgeConfig` selects the driver, read mode, density, drive-select line, port,
-auto-cache behavior, and stalling deadline. `validate()` rejects unsupported
-drive selectors and missing compiled backends. `Bridge::open` probes only
-driver-appropriate candidates in automatic mode; an exact port is always
-honored and never replaced by another candidate.
+and stalling deadline. `validate()` rejects unsupported drive selectors and
+missing compiled backends. `Bridge::open` probes only driver-appropriate
+candidates in automatic mode; an exact port is always honored and never
+replaced by another candidate.
 
 An open `Bridge` owns one physical interface and is neither `Clone` nor backed
 by a global singleton. Dropping it asks the worker to stop, turns the motor
@@ -31,11 +31,12 @@ off, joins the worker, and closes the transport.
 health, readiness, media and write-protect state, motor state, physical
 position, mechanism type, and cylinder limit.
 
-`set_motor`, `seek`, and `no_click_step` enqueue bounded commands. The requested
-cylinder is clamped to the physical mechanism. A seek is coalesced when the
-queue is full because a following read names the desired track again. Other
-commands may return a queue-full or worker-stopped error, but never wait for a
-serial transaction.
+`set_motor` and `seek` record latest-wins desired state rather than queuing
+commands: they cannot fail, cannot be lost, and cannot fall behind a caller
+that expresses them thousands of times a second. The requested cylinder is
+clamped to the physical mechanism. `no_click_step` is a real queued command
+and may return a queue-full or worker-stopped error. Nothing here ever waits
+for a serial transaction.
 
 ## Captures
 
@@ -43,6 +44,13 @@ serial transaction.
 revolution is ready. `ReadMode::Stalling` is the sole exception: it may wait for
 at most `stall_timeout`. A `TrackCapture` contains packed MSB-first `u16` words,
 an exact bit length, a monotonic generation, and a `CaptureQuality`.
+
+While a `ReadMode::Fast` capture is still arriving, `partial_track` returns
+the revolution as far as the head has read it: a monotonically growing prefix
+of the same words the finished capture will contain. A consumer can serve
+those bits at the platter's real pace instead of waiting out the remainder of
+the revolution. The partial is withdrawn the moment the finished capture
+supersedes it.
 
 `IndexAligned` and `VerifiedAmigaDos` captures are safe to retain and replay.
 `Unverified` means the immediate-mode overlap could not be proven as a seamless
@@ -63,9 +71,9 @@ Acceptance is not physical success. Poll `poll_event()` for:
 - `DiskChanged`
 - `Disconnected`
 
-The worker invalidates the destination cache after every attempted write.
-Before touching media it restores both requested cylinder and side, even if
-automatic caching moved the drive after the write was queued.
+The worker invalidates the destination's cached captures after every attempted
+write. Before touching media it restores both requested cylinder and side,
+even if a capture moved the drive after the write was queued.
 
 ## Errors
 
