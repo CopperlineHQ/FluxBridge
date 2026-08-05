@@ -118,7 +118,7 @@ const JOIN_SAMPLE_CELLS: usize = 1_024;
 /// warm-up. Spread out so one patch of weak oxide under a single anchor
 /// cannot veto a join the others prove: a marginal track has exactly such
 /// patches, and where the capture begins relative to them is chance.
-const JOIN_ANCHORS: [usize; 3] = [0, 4_096, 8_192];
+const JOIN_ANCHORS: [usize; 3] = [0, 2_048, 4_096];
 
 /// Locates a repeated revolution boundary in an immediate decoded bit stream.
 ///

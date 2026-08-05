@@ -403,7 +403,12 @@ impl Device for DrawBridge {
         Ok(())
     }
 
-    fn read_track(&mut self, mode: ReadMode, density: DensityMode) -> Result<RawCapture> {
+    fn read_track(
+        &mut self,
+        mode: ReadMode,
+        density: DensityMode,
+        _progress: &mut dyn FnMut(Vec<u16>, usize),
+    ) -> Result<RawCapture> {
         self.choose_density(density)?;
         self.read_stream(mode)
     }

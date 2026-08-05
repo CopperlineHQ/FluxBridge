@@ -52,11 +52,21 @@ struct Desired {
     wanted: Option<TrackAddress>,
 }
 
+/// A capture still on its way in: the track decoded as far as the platter has
+/// turned, republished as it grows so a consumer can read the early sectors
+/// while the later ones are still passing the head.
+struct PartialCapture {
+    track: TrackAddress,
+    words: Vec<u16>,
+    bit_len: usize,
+}
+
 /// Everything a worker shares with the [`Bridge`] that owns it.
 struct SharedState {
     status: Arc<Mutex<DriveStatus>>,
     captures: Arc<Mutex<CaptureCache>>,
     desired: Arc<Mutex<Desired>>,
+    partial: Arc<Mutex<Option<PartialCapture>>>,
     nudge: Receiver<()>,
 }
 
@@ -80,6 +90,7 @@ pub struct Bridge {
     status: Arc<Mutex<DriveStatus>>,
     captures: Arc<Mutex<CaptureCache>>,
     desired: Arc<Mutex<Desired>>,
+    partial: Arc<Mutex<Option<PartialCapture>>>,
     /// Wakes the worker the moment a wish changes, so acting on it is not held
     /// for the tail of a poll interval.
     nudge: Sender<()>,
@@ -116,10 +127,12 @@ impl Bridge {
         let captures = Arc::new(Mutex::new(HashMap::new()));
         let desired = Arc::new(Mutex::new(Desired::default()));
         let (nudge_tx, nudge_rx) = bounded(1);
+        let partial = Arc::new(Mutex::new(None));
         let shared = SharedState {
             status: Arc::clone(&status),
             captures: Arc::clone(&captures),
             desired: Arc::clone(&desired),
+            partial: Arc::clone(&partial),
             nudge: nudge_rx,
         };
         let stall_timeout = (config.mode == ReadMode::Stalling).then_some(config.stall_timeout);
@@ -136,6 +149,7 @@ impl Bridge {
             status,
             captures,
             desired,
+            partial,
             nudge: nudge_tx,
             selected_port,
             next_write: 1,
@@ -222,6 +236,21 @@ impl Bridge {
             }
         }
         Ok(None)
+    }
+
+    /// Returns the capture in flight for a track, as far as it has got.
+    ///
+    /// The words are the decode of the flux the head has passed so far, so a
+    /// consumer can serve them while the rest of the revolution is still
+    /// arriving -- reading behind the platter exactly as a real controller
+    /// does. Grows monotonically until [`Self::read_track`] hands over the
+    /// finished revolution.
+    pub fn partial_track(&mut self, track: TrackAddress) -> Option<(Vec<u16>, usize)> {
+        let track = device::clamp_track(track, self.max_cylinders);
+        lock(&self.partial)
+            .as_ref()
+            .filter(|partial| partial.track == track && partial.bit_len > 0)
+            .map(|partial| (partial.words.clone(), partial.bit_len))
     }
 
     /// Retires a consumed capture so a later read can return fresh flux.
@@ -338,6 +367,7 @@ struct Worker {
     status: Arc<Mutex<DriveStatus>>,
     captures: Arc<Mutex<CaptureCache>>,
     desired: Arc<Mutex<Desired>>,
+    partial: Arc<Mutex<Option<PartialCapture>>>,
     nudge: Receiver<()>,
     target: TrackAddress,
     /// The last track a consumer actually asked to read, which is the only
@@ -375,6 +405,7 @@ impl Worker {
             status: shared.status,
             captures: shared.captures,
             desired: shared.desired,
+            partial: shared.partial,
             nudge: shared.nudge,
             target: TrackAddress::default(),
             wanted: None,
@@ -610,10 +641,18 @@ impl Worker {
             self.note_error(error);
             return false;
         }
-        let capture = match self
-            .device
-            .read_track(self.config.mode, self.config.density)
-        {
+        let publish = Arc::clone(&self.partial);
+        let capture = match self.device.read_track(
+            self.config.mode,
+            self.config.density,
+            &mut |words, bit_len| {
+                *lock(&publish) = Some(PartialCapture {
+                    track: wanted,
+                    words,
+                    bit_len,
+                });
+            },
+        ) {
             Ok(capture) => capture,
             // No index came round: the platter is stopping, spinning up, or
             // holds no disk. That is a state of the world, not a fault.
@@ -627,6 +666,8 @@ impl Worker {
             self.note_error(error);
             return false;
         }
+        // The finished revolution supersedes the partial it grew from.
+        *lock(&self.partial) = None;
         self.consecutive_errors = 0;
         self.generation = self.generation.wrapping_add(1);
         let quality = if capture.index_aligned {
@@ -773,6 +814,7 @@ mod tests {
             &mut self,
             _mode: ReadMode,
             _density: DensityMode,
+            _progress: &mut dyn FnMut(Vec<u16>, usize),
         ) -> Result<device::RawCapture> {
             Ok(device::RawCapture {
                 words: vec![0xaaaa; 6_250],
@@ -901,6 +943,7 @@ mod tests {
             status: Arc::new(Mutex::new(DriveStatus::default())),
             captures: Arc::new(Mutex::new(HashMap::new())),
             desired: Arc::clone(&desired),
+            partial: Arc::new(Mutex::new(None)),
             nudge: nudge_tx,
             selected_port: PortId::new("fake").unwrap(),
             next_write: 1,

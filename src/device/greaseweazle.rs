@@ -6,11 +6,15 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::device::{Device, RawCapture, drive_selection, operation_deadline, validate_capture};
-use crate::flux::{FluxEvent, flux_to_revolution, flux_to_unaligned_revolution, mfm_to_flux};
+use crate::flux::{
+    FluxEvent, PllDecoder, bits_to_unaligned_revolution, flux_to_revolution,
+    flux_to_unaligned_revolution, mfm_to_flux, pack_bits,
+};
 use crate::transport::{self, Transport, read_exact_until, read_terminated_until, write_all_until};
 use crate::{
     BridgeConfig, DensityMode, DriveStatus, DriveType, Error, PortId, ReadMode, Result, Side,
 };
+use std::io;
 
 const BAUD: u32 = 9_600;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
@@ -269,6 +273,138 @@ impl Greaseweazle {
         self.expect_ok(Command::SetParams, &parameters)
     }
 
+    /// Streams an immediate capture, publishing the decoded track as it grows.
+    ///
+    /// A revolution takes as long as the disk takes to turn, and the consumer
+    /// can read the early sectors while the later ones are still passing the
+    /// head -- exactly as a real controller does. Each publish hands the
+    /// decode-so-far to `progress`; the finished, join-proved revolution is
+    /// returned as usual.
+    fn read_stream_fast(
+        &mut self,
+        progress: &mut dyn FnMut(Vec<u16>, usize),
+    ) -> Result<RawCapture> {
+        self.select(true)?;
+        let ticks = u32::try_from(u64::from(self.sample_frequency) * 232 / 1_000)
+            .expect("232ms tick count fits u32");
+        let mut header = Vec::with_capacity(10);
+        header.extend_from_slice(&ticks.to_le_bytes());
+        header.extend_from_slice(&0_u16.to_le_bytes());
+        header.extend_from_slice(&0_u32.to_le_bytes());
+
+        let mut attempt = 0_u32;
+        let bits = loop {
+            attempt += 1;
+            self.expect_ok(Command::ReadFlux, &header)?;
+            let deadline = Instant::now() + STREAM_TIMEOUT;
+            let bits = self.drain_fast_stream(deadline, progress)?;
+            let status = self.raw_command_ack(Command::GetFluxStatus, &[])?;
+            match status {
+                ACK_OK => {
+                    self.status.disk_present = true;
+                    self.status.ready = true;
+                    break bits;
+                }
+                ACK_NO_INDEX => {
+                    self.status.disk_present = false;
+                    return Err(Error::Timeout("Greaseweazle index pulse"));
+                }
+                ACK_FLUX_OVERFLOW if attempt < 3 => {
+                    self.transport.purge()?;
+                    // The failed attempt's partial is stale; say so.
+                    progress(Vec::new(), 0);
+                }
+                ACK_FLUX_OVERFLOW => {
+                    return Err(Error::Protocol(
+                        "Greaseweazle flux receive buffer overflowed".into(),
+                    ));
+                }
+                other => map_ack(Command::GetFluxStatus, other)?,
+            }
+        };
+        if !self.status.motor_running {
+            self.select(false)?;
+        }
+        let joined = bits_to_unaligned_revolution(&bits, self.high_density)?;
+        let bit_len = joined.len();
+        let capture = RawCapture {
+            words: pack_bits(&joined),
+            bit_len,
+            index_aligned: false,
+        };
+        validate_capture(&capture)?;
+        Ok(capture)
+    }
+
+    /// Drains one immediate flux stream, decoding and publishing as it goes.
+    ///
+    /// The whole buffer is re-decoded at each publish rather than carrying
+    /// decoder state across chunk boundaries: the stream is small, the decode
+    /// is microseconds, and a boundary that splits a multi-byte sequence then
+    /// simply skips one publish instead of needing a resumable decoder. A
+    /// publish that fails to decode is not an error -- only the terminated
+    /// stream has to.
+    fn drain_fast_stream(
+        &mut self,
+        deadline: Instant,
+        progress: &mut dyn FnMut(Vec<u16>, usize),
+    ) -> Result<Vec<bool>> {
+        let mut raw: Vec<u8> = Vec::with_capacity(160 * 1024);
+        let mut chunk = [0_u8; 8 * 1024];
+        let mut published = 0_usize;
+        loop {
+            if raw.len() >= MAX_STREAM_BYTES {
+                return Err(Error::TrackTooLarge {
+                    bits: raw.len() * 8,
+                    limit: MAX_STREAM_BYTES * 8,
+                });
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(Error::Timeout("Greaseweazle flux stream"))?;
+            self.transport
+                .set_timeout(remaining.min(Duration::from_millis(250)))?;
+            match self.transport.read(&mut chunk) {
+                Ok(0) => return Err(Error::Disconnected),
+                Ok(read) => {
+                    let (data, done) = match chunk[..read].iter().position(|&byte| byte == 0) {
+                        Some(end) => (&chunk[..end], true),
+                        None => (&chunk[..read], false),
+                    };
+                    raw.extend_from_slice(data);
+                    if done {
+                        let events = decode_stream(&raw, self.sample_frequency, self.high_density)?;
+                        let mut pll = PllDecoder::new();
+                        let mut bits = Vec::with_capacity(150_000);
+                        for event in &events {
+                            pll.submit(event.nanoseconds, &mut bits);
+                        }
+                        progress(pack_bits(&bits), bits.len());
+                        return Ok(bits);
+                    }
+                    if raw.len() >= published + 8 * 1024
+                        && let Ok(events) =
+                            decode_stream(&raw, self.sample_frequency, self.high_density)
+                    {
+                        let mut pll = PllDecoder::new();
+                        let mut bits = Vec::with_capacity(150_000);
+                        for event in &events {
+                            pll.submit(event.nanoseconds, &mut bits);
+                        }
+                        progress(pack_bits(&bits), bits.len());
+                        published = raw.len();
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     fn read_stream(&mut self, mode: ReadMode) -> Result<RawCapture> {
         self.select(true)?;
         // Every read carries a tick ceiling as well as an index count: the
@@ -276,10 +412,13 @@ impl Greaseweazle {
         // platter stopped -- a motor switched off mid-capture, or no disk in
         // the drive. Without it the firmware streams until an index that will
         // never come, and the worker hangs with it.
+        // The immediate window holds one revolution plus the overlap the join
+        // needs: the anchors' reach past a revolution, with margin for a drive
+        // running slow, where the same cells take longer to pass the head.
         let (ticks, max_index, linger) = if mode == ReadMode::Fast {
             (
-                u32::try_from(u64::from(self.sample_frequency) * 260 / 1_000)
-                    .expect("260ms tick count fits u32"),
+                u32::try_from(u64::from(self.sample_frequency) * 232 / 1_000)
+                    .expect("232ms tick count fits u32"),
                 0_u16,
                 0_u32,
             )
@@ -503,13 +642,22 @@ impl Device for Greaseweazle {
         self.check_pins()
     }
 
-    fn read_track(&mut self, mode: ReadMode, density: DensityMode) -> Result<RawCapture> {
+    fn read_track(
+        &mut self,
+        mode: ReadMode,
+        density: DensityMode,
+        progress: &mut dyn FnMut(Vec<u16>, usize),
+    ) -> Result<RawCapture> {
         self.high_density = match density {
             DensityMode::Double => false,
             DensityMode::High => true,
             DensityMode::Auto => self.high_density,
         };
-        self.read_stream(mode)
+        if mode == ReadMode::Fast {
+            self.read_stream_fast(progress)
+        } else {
+            self.read_stream(mode)
+        }
     }
 
     fn write_track(

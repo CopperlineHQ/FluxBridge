@@ -478,7 +478,12 @@ impl Device for SuperCardPro {
         self.check_pins()
     }
 
-    fn read_track(&mut self, mode: ReadMode, density: DensityMode) -> Result<RawCapture> {
+    fn read_track(
+        &mut self,
+        mode: ReadMode,
+        density: DensityMode,
+        _progress: &mut dyn FnMut(Vec<u16>, usize),
+    ) -> Result<RawCapture> {
         self.high_density =
             density == DensityMode::High || (density == DensityMode::Auto && self.high_density);
         self.read_stream(mode)
