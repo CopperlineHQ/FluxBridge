@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#![cfg(feature = "hardware-tests")]
-
 //! Explicit, ignored probes for a user-selected physical interface and disk.
+#![cfg(feature = "hardware-tests")]
 
 use std::str::FromStr;
 use std::thread;

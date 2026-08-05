@@ -99,6 +99,18 @@ pub(super) struct Greaseweazle {
     high_density: bool,
 }
 
+/// Index of the step interval within the interface's delay block, which is
+/// `select, step, seek_settle, motor, watchdog` as little-endian `u16`s.
+const DELAY_STEP: usize = 1;
+/// Index of the spindle-motor delay within the same block.
+const DELAY_MOTOR: usize = 3;
+
+/// Interval between head steps to ask the interface for, in microseconds.
+///
+/// An Amiga's trackdisk steps every 3 ms and the machine's own stepper charges
+/// the same, so anything slower leaves the real head behind the emulated one.
+const STEP_INTERVAL_US: u16 = 3_000;
+
 impl Greaseweazle {
     pub(super) fn open(port: PortId, config: &BridgeConfig) -> Result<Box<dyn Device>> {
         let transport = transport::open(&port, BAUD, COMMAND_TIMEOUT)?;
@@ -147,6 +159,16 @@ impl Greaseweazle {
         let delay_bytes = device.command(Command::GetParams, &[0, 10], 10)?;
         for (index, chunk) in delay_bytes.chunks_exact(2).enumerate() {
             device.delays[index] = u16::from_le_bytes([chunk[0], chunk[1]]);
+        }
+        // Step the head at the rate the machine driving it does. A
+        // Greaseweazle defaults to 10 ms between steps, where an Amiga's
+        // trackdisk steps every 3 ms, so the default leaves the real head
+        // still travelling long after the emulated one has arrived -- audible
+        // as a drawn-out seek, and slow enough that a multi-cylinder move
+        // dominates the time a track takes to read.
+        if device.delays[DELAY_STEP] != STEP_INTERVAL_US {
+            device.delays[DELAY_STEP] = STEP_INTERVAL_US;
+            device.update_delays()?;
         }
         device.expect_ok(Command::SetBusType, &[bus])?;
         device.check_pins()?;
@@ -429,8 +451,8 @@ impl Device for Greaseweazle {
 
     fn set_motor(&mut self, enabled: bool, quick: bool) -> Result<()> {
         let desired_delay = if quick { 10 } else { 750 };
-        if self.delays[3] != desired_delay {
-            self.delays[3] = desired_delay;
+        if self.delays[DELAY_MOTOR] != desired_delay {
+            self.delays[DELAY_MOTOR] = desired_delay;
             self.update_delays()?;
         }
         self.expect_ok(Command::Motor, &[self.drive, u8::from(enabled)])?;

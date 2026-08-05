@@ -162,12 +162,30 @@ mod serial {
         Ok(Box::new(SerialTransport(port)))
     }
 
+    /// Whether a serial device node is one that can actually be opened.
+    ///
+    /// macOS exposes every serial device twice: `/dev/cu.*` is the call-out
+    /// node, and `/dev/tty.*` the call-in node, which blocks on open until
+    /// carrier detect is asserted. A USB CDC device never asserts it, so
+    /// opening the `tty` node hangs. Listing only the `cu` node also stops one
+    /// interface appearing as two.
+    #[cfg(target_os = "macos")]
+    fn is_openable(port_name: &str) -> bool {
+        !port_name.starts_with("/dev/tty.")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn is_openable(_port_name: &str) -> bool {
+        true
+    }
+
     pub(super) fn list() -> Result<Vec<PortInfo>> {
         serialport::available_ports()
             .map_err(map_error)
             .and_then(|ports| {
                 ports
                     .into_iter()
+                    .filter(|port| is_openable(&port.port_name))
                     .map(|port| {
                         let (vid, pid, serial_number, product) = match port.port_type {
                             SerialPortType::UsbPort(usb) => {
