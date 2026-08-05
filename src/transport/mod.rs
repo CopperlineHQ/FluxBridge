@@ -151,9 +151,11 @@ mod serial {
     }
 
     pub(super) fn open(id: &PortId, baud: u32, timeout: Duration) -> Result<Box<dyn Transport>> {
+        // serialport opens exclusively by default on Unix; Windows creates
+        // the COM handle without sharing. Its explicit `exclusive` builder
+        // method is therefore unnecessary and is not available on Windows.
         let port = serialport::new(id.as_str(), baud)
             .timeout(timeout)
-            .exclusive(true)
             .open()
             .map_err(map_error)?;
         Ok(Box::new(SerialTransport(port)))
