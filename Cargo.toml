@@ -2,10 +2,10 @@
 
 [package]
 name = "fluxbridge"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.93"
-authors = ["Copperline contributors"]
+authors = ["Lee Hobson", "Copperline contributors"]
 description = "Safe Rust access to DrawBridge, Greaseweazle, and SuperCard Pro floppy interfaces"
 license = "LGPL-3.0-or-later AND MPL-2.0"
 repository = "https://github.com/CopperlineHQ/FluxBridge"

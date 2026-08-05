@@ -14,7 +14,6 @@ bitflags! {
     /// Optional facilities implemented by a bridge driver.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct Capabilities: u32 {
-        /// Background capture of tracks adjacent to the active track.
         /// Automatic serial-port discovery.
         const AUTO_DETECT_PORT = 1 << 1;
         /// IBM PC Drive A/Drive B cable selection.
@@ -92,18 +91,12 @@ pub struct DriverInfo {
     pub capabilities: Capabilities,
 }
 
-/// Drivers compiled into this build.
+/// Drivers compiled into this build, most mature first.
+///
+/// The order is meaningful: [`crate::drivers`] hands it to embedding
+/// applications for menus, and [`BridgeConfig::default`] selects the first
+/// entry, so the best-supported driver leads.
 pub(crate) static DRIVERS: &[DriverInfo] = &[
-    #[cfg(feature = "drawbridge")]
-    DriverInfo {
-        kind: DriverKind::DrawBridge,
-        name: "DrawBridge",
-        manufacturer: "RobSmithDev",
-        url: "https://amiga.robsmithdev.co.uk/",
-        capabilities: Capabilities::AUTO_DETECT_PORT
-            .union(Capabilities::HIGH_DENSITY)
-            .union(Capabilities::DIRECT_FTDI),
-    },
     #[cfg(feature = "greaseweazle")]
     DriverInfo {
         kind: DriverKind::Greaseweazle,
@@ -114,6 +107,16 @@ pub(crate) static DRIVERS: &[DriverInfo] = &[
             .union(Capabilities::PC_DRIVE_SELECT)
             .union(Capabilities::SHUGART_DRIVE_SELECT)
             .union(Capabilities::HIGH_DENSITY),
+    },
+    #[cfg(feature = "drawbridge")]
+    DriverInfo {
+        kind: DriverKind::DrawBridge,
+        name: "DrawBridge",
+        manufacturer: "RobSmithDev",
+        url: "https://amiga.robsmithdev.co.uk/",
+        capabilities: Capabilities::AUTO_DETECT_PORT
+            .union(Capabilities::HIGH_DENSITY)
+            .union(Capabilities::DIRECT_FTDI),
     },
     #[cfg(feature = "supercard-pro")]
     DriverInfo {
@@ -308,9 +311,12 @@ pub struct BridgeConfig {
 }
 
 impl Default for BridgeConfig {
+    /// Defaults to the first compiled driver (see [`crate::drivers`]).
     fn default() -> Self {
         Self {
-            driver: DriverKind::DrawBridge,
+            driver: DRIVERS
+                .first()
+                .map_or(DriverKind::Greaseweazle, |driver| driver.kind),
             mode: ReadMode::Compatible,
             density: DensityMode::Auto,
             drive: DriveSelect::PcA,

@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-//! Safe Rust access to physical floppy drives through DrawBridge,
-//! Greaseweazle, and SuperCard Pro interfaces.
+//! Safe Rust access to physical floppy drives through Greaseweazle,
+//! DrawBridge, and SuperCard Pro interfaces.
 //!
-//! FluxBridge is a Rust port of the runtime portions of Rob Smith's
-//! [FloppyDriveBridge](https://github.com/RobSmithDev/FloppyDriveBridge).
-//! It exposes typed configuration, non-blocking track capture, and observable
-//! asynchronous writes without a C or C++ ABI.
+//! FluxBridge began as a Rust port of the runtime portions of Rob Smith's
+//! [FloppyDriveBridge](https://github.com/RobSmithDev/FloppyDriveBridge) and
+//! has since been substantially reworked around an emulator's real needs. It
+//! exposes typed configuration, non-blocking track capture that can stream a
+//! revolution while the platter is still turning it, and observable
+//! asynchronous writes, all without a C or C++ ABI.
 
 #![forbid(unsafe_code)]
 

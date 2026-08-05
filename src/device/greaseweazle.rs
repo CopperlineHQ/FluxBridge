@@ -115,6 +115,32 @@ const DELAY_MOTOR: usize = 3;
 /// the same, so anything slower leaves the real head behind the emulated one.
 const STEP_INTERVAL_US: u16 = 3_000;
 
+/// Raw flux delay below which an interval reads as high-density.
+///
+/// Double-density MFM has no legal interval under 4 µs; high-density halves
+/// every cell, making 2 µs its most common interval. 3 µs sits in the gap
+/// neither density occupies.
+const HD_INTERVAL_CEILING_NS: u32 = 3_000;
+
+/// Minimum decoded intervals before density detection is trusted.
+///
+/// Below this the capture is noise or an unformatted surface, and the last
+/// known density is kept instead.
+const HD_DETECT_MIN_EVENTS: usize = 1_000;
+
+/// Whether raw (undoubled) flux delays look like high-density MFM.
+///
+/// On double-density media effectively no interval falls under 3 µs; on
+/// high-density media the 2 µs cell alone is roughly half of them. One
+/// quarter is therefore a decisive quorum with a wide margin on both sides.
+fn looks_high_density(events: &[FluxEvent]) -> bool {
+    let short = events
+        .iter()
+        .filter(|event| event.nanoseconds < HD_INTERVAL_CEILING_NS)
+        .count();
+    short * 4 > events.len()
+}
+
 impl Greaseweazle {
     pub(super) fn open(port: PortId, config: &BridgeConfig) -> Result<Box<dyn Device>> {
         let transport = transport::open(&port, BAUD, COMMAND_TIMEOUT)?;
@@ -273,6 +299,32 @@ impl Greaseweazle {
         self.expect_ok(Command::SetParams, &parameters)
     }
 
+    /// Decodes a raw flux stream, resolving the effective density first.
+    ///
+    /// Forced densities decode as ordered. `Auto` measures the raw intervals
+    /// themselves -- a Greaseweazle has no density sense line to ask, but the
+    /// flux is unambiguous. The verdict sticks in `self.high_density`, so an
+    /// `Auto` write lands at the density the disk last read as.
+    fn decode_at_density(&mut self, raw: &[u8], density: DensityMode) -> Result<Vec<FluxEvent>> {
+        let mut events = decode_stream(raw, self.sample_frequency)?;
+        self.high_density = match density {
+            DensityMode::Double => false,
+            DensityMode::High => true,
+            DensityMode::Auto if events.len() >= HD_DETECT_MIN_EVENTS => {
+                looks_high_density(&events)
+            }
+            DensityMode::Auto => self.high_density,
+        };
+        if self.high_density {
+            // Present each 1 µs HD cell to the shared 2 µs PLL as its
+            // double-density twin, exactly as the hardware bridges do.
+            for event in &mut events {
+                event.nanoseconds = event.nanoseconds.saturating_mul(2);
+            }
+        }
+        Ok(events)
+    }
+
     /// Streams an immediate capture, publishing the decoded track as it grows.
     ///
     /// A revolution takes as long as the disk takes to turn, and the consumer
@@ -282,6 +334,7 @@ impl Greaseweazle {
     /// returned as usual.
     fn read_stream_fast(
         &mut self,
+        density: DensityMode,
         progress: &mut dyn FnMut(Vec<u16>, usize),
     ) -> Result<RawCapture> {
         self.select(true)?;
@@ -297,7 +350,7 @@ impl Greaseweazle {
             attempt += 1;
             self.expect_ok(Command::ReadFlux, &header)?;
             let deadline = Instant::now() + STREAM_TIMEOUT;
-            let bits = self.drain_fast_stream(deadline, progress)?;
+            let bits = self.drain_fast_stream(deadline, density, progress)?;
             let status = self.raw_command_ack(Command::GetFluxStatus, &[])?;
             match status {
                 ACK_OK => {
@@ -343,10 +396,12 @@ impl Greaseweazle {
     /// is microseconds, and a boundary that splits a multi-byte sequence then
     /// simply skips one publish instead of needing a resumable decoder. A
     /// publish that fails to decode is not an error -- only the terminated
-    /// stream has to.
+    /// stream has to. Density is resolved per decode, so an `Auto` capture
+    /// serves its first partial at the detected density already.
     fn drain_fast_stream(
         &mut self,
         deadline: Instant,
+        density: DensityMode,
         progress: &mut dyn FnMut(Vec<u16>, usize),
     ) -> Result<Vec<bool>> {
         let mut raw: Vec<u8> = Vec::with_capacity(160 * 1024);
@@ -373,7 +428,7 @@ impl Greaseweazle {
                     };
                     raw.extend_from_slice(data);
                     if done {
-                        let events = decode_stream(&raw, self.sample_frequency, self.high_density)?;
+                        let events = self.decode_at_density(&raw, density)?;
                         let mut pll = PllDecoder::new();
                         let mut bits = Vec::with_capacity(150_000);
                         for event in &events {
@@ -383,8 +438,7 @@ impl Greaseweazle {
                         return Ok(bits);
                     }
                     if raw.len() >= published + 4 * 1024
-                        && let Ok(events) =
-                            decode_stream(&raw, self.sample_frequency, self.high_density)
+                        && let Ok(events) = self.decode_at_density(&raw, density)
                     {
                         let mut pll = PllDecoder::new();
                         let mut bits = Vec::with_capacity(150_000);
@@ -405,7 +459,7 @@ impl Greaseweazle {
         }
     }
 
-    fn read_stream(&mut self, mode: ReadMode) -> Result<RawCapture> {
+    fn read_stream(&mut self, mode: ReadMode, density: DensityMode) -> Result<RawCapture> {
         self.select(true)?;
         // Every read carries a tick ceiling as well as an index count: the
         // index bound ends a healthy read, and the ceiling ends one whose
@@ -484,7 +538,7 @@ impl Greaseweazle {
             self.select(false)?;
         }
 
-        let events = decode_stream(&stream, self.sample_frequency, self.high_density)?;
+        let events = self.decode_at_density(&stream, density)?;
         let index_aligned = mode != ReadMode::Fast;
         let (words, bit_len, extracted_index) = if index_aligned {
             flux_to_revolution(&events)?
@@ -648,15 +702,10 @@ impl Device for Greaseweazle {
         density: DensityMode,
         progress: &mut dyn FnMut(Vec<u16>, usize),
     ) -> Result<RawCapture> {
-        self.high_density = match density {
-            DensityMode::Double => false,
-            DensityMode::High => true,
-            DensityMode::Auto => self.high_density,
-        };
         if mode == ReadMode::Fast {
-            self.read_stream_fast(progress)
+            self.read_stream_fast(density, progress)
         } else {
-            self.read_stream(mode)
+            self.read_stream(mode, density)
         }
     }
 
@@ -707,7 +756,7 @@ fn read_28bit(queue: &mut VecDeque<u8>) -> Result<u32> {
     Ok(value >> 1)
 }
 
-fn decode_stream(bytes: &[u8], frequency: u32, high_density: bool) -> Result<Vec<FluxEvent>> {
+fn decode_stream(bytes: &[u8], frequency: u32) -> Result<Vec<FluxEvent>> {
     let mut queue = VecDeque::from(bytes.to_vec());
     let mut ticks = 0_u32;
     let mut index = false;
@@ -746,13 +795,10 @@ fn decode_stream(bytes: &[u8], frequency: u32, high_density: bool) -> Result<Vec
                 250 + (u32::from(byte) - 250) * 255 + u32::from(low).saturating_sub(1),
             );
         }
-        let mut nanoseconds = u32::try_from(
+        let nanoseconds = u32::try_from(
             (u64::from(ticks) * 1_000_000_000 + u64::from(frequency) / 2) / u64::from(frequency),
         )
         .map_err(|_| Error::Protocol("Greaseweazle flux interval is too large".into()))?;
-        if high_density {
-            nanoseconds = nanoseconds.saturating_mul(2);
-        }
         events.push(FluxEvent { nanoseconds, index });
         ticks = 0;
         index = false;
@@ -802,7 +848,7 @@ mod tests {
     #[test]
     fn flux_tick_forms_decode() {
         let bytes = [80, 250, 6, 255, 2, 21, 1, 1, 1, 40];
-        let events = decode_stream(&bytes, 40_000_000, false).unwrap();
+        let events = decode_stream(&bytes, 40_000_000).unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].nanoseconds, 2_000);
         assert!(events.iter().all(|event| event.nanoseconds > 0));
@@ -813,7 +859,7 @@ mod tests {
         for ticks in [80, 160, 240, 250, 700, 2_000] {
             let mut bytes = Vec::new();
             encode_ticks(ticks, &mut bytes);
-            let events = decode_stream(&bytes, 40_000_000, false).unwrap();
+            let events = decode_stream(&bytes, 40_000_000).unwrap();
             assert_eq!(events.len(), 1);
             let decoded = events[0].nanoseconds / 25;
             assert_eq!(decoded, ticks);

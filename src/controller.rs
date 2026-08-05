@@ -82,8 +82,10 @@ type CaptureCache = HashMap<TrackAddress, VecDeque<TrackCapture>>;
 /// One open physical drive.
 ///
 /// The transport and every mutable hardware fact are owned by a worker
-/// thread. Public methods only enqueue bounded commands or inspect snapshots,
-/// so normal reads never block the caller on a rotating disk.
+/// thread. Public methods record latest-wins wishes (motor, head position,
+/// the track worth capturing), enqueue the few real commands (writes,
+/// shutdown, the no-click step), or inspect snapshots, so normal reads never
+/// block the caller on a rotating disk.
 pub struct Bridge {
     commands: Sender<Command>,
     events: Receiver<BridgeEvent>,
