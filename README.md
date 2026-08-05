@@ -16,7 +16,7 @@ pure Rust and forbids unsafe code.
 
 | Interface | State |
 |---|---|
-| [Greaseweazle](https://github.com/keirf/greaseweazle) | Supported. Tested on real hardware and tuned for emulator use. Needs main firmware 0.27 or newer. |
+| [Greaseweazle](https://github.com/keirf/greaseweazle) | Supported. Tested on real hardware on macOS, Windows, and Linux hosts; tuned for emulator use. Needs main firmware 0.27 or newer. |
 | DrawBridge | Protocol implemented behind the `drawbridge` feature. Not yet tested on hardware. |
 | SuperCard Pro | Protocol implemented behind the `supercard-pro` feature. Not yet tested on hardware. |
 

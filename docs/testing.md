@@ -48,6 +48,6 @@ then validated end-to-end under Copperline on an IBM PC Drive A cable:
 repeated Workbench 1.3 boots to the desktop from the physical disk under
 Kickstart 1.3, all three read modes exercised, streamed partial serving
 active, and whole boots completing without a single failed join
-reconstruction. Passing CI still proves controller and protocol behaviour
+reconstruction -- on macOS, Windows 11, and Linux hosts. Passing CI still proves controller and protocol behaviour
 rather than electrical compatibility with every firmware and drive
 combination.
