@@ -42,7 +42,14 @@ enum Command {
 #[derive(Default, Clone, Copy)]
 struct Desired {
     motor: Option<(crate::Side, bool)>,
+    /// Where the head belongs. Follows the machine's stepper, including every
+    /// cylinder it passes through mid-seek.
     target: Option<TrackAddress>,
+    /// The track somebody is actually waiting to read. Only this is worth a
+    /// capture: the head passes dozens of cylinders on its way somewhere, and
+    /// a reading taken of one of them costs a whole uninterruptible window
+    /// that the destination then queues behind.
+    wanted: Option<TrackAddress>,
 }
 
 /// Everything a worker shares with the [`Bridge`] that owns it.
@@ -185,7 +192,11 @@ impl Bridge {
     /// Returns the newest completed capture for a track, if one is ready.
     pub fn read_track(&mut self, track: TrackAddress) -> Result<Option<TrackCapture>> {
         let track = device::clamp_track(track, self.max_cylinders);
-        lock(&self.desired).target = Some(track);
+        {
+            let mut desired = lock(&self.desired);
+            desired.target = Some(track);
+            desired.wanted = Some(track);
+        }
         let capture = || {
             lock(&self.captures)
                 .get(&track)
@@ -221,7 +232,11 @@ impl Bridge {
         }
         // The worker refills any track below its capture depth on its own;
         // naming the track keeps the head there while it does.
-        lock(&self.desired).target = Some(track);
+        {
+            let mut desired = lock(&self.desired);
+            desired.target = Some(track);
+            desired.wanted = Some(track);
+        }
         self.nudge();
         Ok(())
     }
@@ -325,6 +340,9 @@ struct Worker {
     desired: Arc<Mutex<Desired>>,
     nudge: Receiver<()>,
     target: TrackAddress,
+    /// The last track a consumer actually asked to read, which is the only
+    /// thing worth spending a capture window on. `None` until the first ask.
+    wanted: Option<TrackAddress>,
     physical: TrackAddress,
     positioned: bool,
     failed: bool,
@@ -332,6 +350,10 @@ struct Worker {
     /// occasional weather; only an unbroken run of failures means the drive is
     /// really gone.
     consecutive_errors: u32,
+    /// When the spindle was last switched off. A platter coasts for a while,
+    /// so a restart inside that window needs no fresh spin-up wait -- the
+    /// guest's own emulated spin-up already covers what little is left.
+    motor_stopped_at: Option<Instant>,
     generation: u64,
     next_status: Instant,
     cache_cursor: u8,
@@ -355,10 +377,12 @@ impl Worker {
             desired: shared.desired,
             nudge: shared.nudge,
             target: TrackAddress::default(),
+            wanted: None,
             physical: TrackAddress::default(),
             positioned: false,
             failed: false,
             consecutive_errors: 0,
+            motor_stopped_at: None,
             generation: 0,
             next_status: Instant::now(),
             cache_cursor: 0,
@@ -441,8 +465,12 @@ impl Worker {
             Desired {
                 motor: desired.motor.take(),
                 target: desired.target.take(),
+                wanted: desired.wanted.take(),
             }
         };
+        if let Some(track) = wish.wanted {
+            self.wanted = Some(track);
+        }
         if let Some(track) = wish.target {
             self.target = track;
             if let Err(error) = self.position(track) {
@@ -452,15 +480,24 @@ impl Worker {
             self.consecutive_errors = 0;
         }
         if let Some((side, enabled)) = wish.motor {
+            let quick = !enabled
+                || self
+                    .motor_stopped_at
+                    .is_some_and(|stopped| stopped.elapsed() < Duration::from_secs(2));
             let result = self
                 .position(TrackAddress {
                     cylinder: self.target.cylinder,
                     side,
                 })
-                .and_then(|()| self.device.set_motor(enabled, false))
+                .and_then(|()| self.device.set_motor(enabled, quick))
                 .map(|()| lock(&self.status).motor_running = enabled);
             match result {
-                Ok(()) => self.consecutive_errors = 0,
+                Ok(()) => {
+                    self.consecutive_errors = 0;
+                    if !enabled {
+                        self.motor_stopped_at = Some(Instant::now());
+                    }
+                }
                 Err(error) => self.note_error(error),
             }
         }
@@ -537,10 +574,21 @@ impl Worker {
             return false;
         }
 
-        let mut wanted = self.target;
+        let Some(demanded) = self.wanted else {
+            return false;
+        };
+        // Only once the stepper's destination is the demanded track. While the
+        // head is being walked somewhere -- a recalibration, a long seek -- the
+        // consumer's last demand still names where it used to be, and capturing
+        // there would drag the head back against the journey, over and over.
+        // The next poll for the settled head names both afresh.
+        if demanded != self.target {
+            return false;
+        }
+        let mut wanted = demanded;
         let target_full = {
             let cache = lock(&self.captures);
-            let captures = cache.get(&self.target);
+            let captures = cache.get(&demanded);
             let depth = wanted_depth(captures.and_then(VecDeque::back));
             captures.is_some_and(|captures| captures.len() >= depth)
         };
@@ -597,7 +645,7 @@ impl Worker {
         let mut cache = lock(&self.captures);
         if cache.len() >= MAX_CACHED_TRACKS
             && !cache.contains_key(&wanted)
-            && let Some(key) = cache.keys().copied().find(|key| *key != self.target)
+            && let Some(key) = cache.keys().copied().find(|key| *key != demanded)
         {
             cache.remove(&key);
         }
