@@ -386,7 +386,6 @@ struct Worker {
     motor_stopped_at: Option<Instant>,
     generation: u64,
     next_status: Instant,
-    cache_cursor: u8,
 }
 
 impl Worker {
@@ -416,7 +415,6 @@ impl Worker {
             motor_stopped_at: None,
             generation: 0,
             next_status: Instant::now(),
-            cache_cursor: 0,
         }
     }
 
@@ -567,8 +565,8 @@ impl Worker {
             bit_len,
             start_bit,
         } = request;
-        // Restore both coordinates immediately before every write. Auto-cache
-        // may have moved either one since the request was queued.
+        // Restore both coordinates immediately before every write: the head
+        // may have moved for a capture since the request was queued.
         let result = self.position(track).and_then(|()| {
             let track_bits = lock(&self.captures)
                 .get(&track)
@@ -616,24 +614,14 @@ impl Worker {
         if demanded != self.target {
             return false;
         }
-        let mut wanted = demanded;
+        let wanted = demanded;
         let target_full = {
             let cache = lock(&self.captures);
             let captures = cache.get(&demanded);
             let depth = wanted_depth(captures.and_then(VecDeque::back));
             captures.is_some_and(|captures| captures.len() >= depth)
         };
-        if target_full && self.config.auto_cache {
-            let max = status.max_cylinders.max(1);
-            self.cache_cursor = self.cache_cursor.wrapping_add(1) % max;
-            wanted.cylinder = self.cache_cursor;
-            if lock(&self.captures)
-                .get(&wanted)
-                .is_some_and(|captures| !captures.is_empty())
-            {
-                return false;
-            }
-        } else if target_full {
+        if target_full {
             return false;
         }
 
@@ -835,7 +823,7 @@ mod tests {
         }
     }
 
-    fn fake_bridge(auto_cache: bool) -> FakeBridge {
+    fn fake_bridge() -> FakeBridge {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let status = DriveStatus {
@@ -855,7 +843,6 @@ mod tests {
         };
         let config = BridgeConfig {
             driver: DriverKind::DrawBridge,
-            auto_cache,
             port: PortSelection::Auto,
             ..BridgeConfig::default()
         };
@@ -870,7 +857,7 @@ mod tests {
 
     #[test]
     fn capture_is_nonblocking_and_eventually_available() {
-        let (mut bridge, _, _) = fake_bridge(false);
+        let (mut bridge, _, _) = fake_bridge();
         let track = TrackAddress::default();
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
@@ -884,8 +871,8 @@ mod tests {
     }
 
     #[test]
-    fn write_restores_target_after_auto_cache_move() {
-        let (mut bridge, writes, _) = fake_bridge(true);
+    fn write_restores_target_after_capture_move() {
+        let (mut bridge, writes, _) = fake_bridge();
         let target = TrackAddress {
             cylinder: 40,
             side: Side::Upper,
@@ -908,7 +895,7 @@ mod tests {
 
     #[test]
     fn first_position_selects_both_coordinates_and_motor_uses_spin_up_delay() {
-        let (mut bridge, _, calls) = fake_bridge(false);
+        let (mut bridge, _, calls) = fake_bridge();
         bridge.set_motor(Side::Lower, true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {

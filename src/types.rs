@@ -15,7 +15,6 @@ bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct Capabilities: u32 {
         /// Background capture of tracks adjacent to the active track.
-        const AUTO_CACHE = 1 << 0;
         /// Automatic serial-port discovery.
         const AUTO_DETECT_PORT = 1 << 1;
         /// IBM PC Drive A/Drive B cable selection.
@@ -101,8 +100,7 @@ pub(crate) static DRIVERS: &[DriverInfo] = &[
         name: "DrawBridge",
         manufacturer: "RobSmithDev",
         url: "https://amiga.robsmithdev.co.uk/",
-        capabilities: Capabilities::AUTO_CACHE
-            .union(Capabilities::AUTO_DETECT_PORT)
+        capabilities: Capabilities::AUTO_DETECT_PORT
             .union(Capabilities::HIGH_DENSITY)
             .union(Capabilities::DIRECT_FTDI),
     },
@@ -112,8 +110,7 @@ pub(crate) static DRIVERS: &[DriverInfo] = &[
         name: "Greaseweazle",
         manufacturer: "Keir Fraser",
         url: "https://github.com/keirf/greaseweazle",
-        capabilities: Capabilities::AUTO_CACHE
-            .union(Capabilities::AUTO_DETECT_PORT)
+        capabilities: Capabilities::AUTO_DETECT_PORT
             .union(Capabilities::PC_DRIVE_SELECT)
             .union(Capabilities::SHUGART_DRIVE_SELECT)
             .union(Capabilities::HIGH_DENSITY),
@@ -124,8 +121,7 @@ pub(crate) static DRIVERS: &[DriverInfo] = &[
         name: "SuperCard Pro",
         manufacturer: "CBMSTUFF.COM",
         url: "https://www.cbmstuff.com/",
-        capabilities: Capabilities::AUTO_CACHE
-            .union(Capabilities::AUTO_DETECT_PORT)
+        capabilities: Capabilities::AUTO_DETECT_PORT
             .union(Capabilities::PC_DRIVE_SELECT)
             .union(Capabilities::HIGH_DENSITY),
     },
@@ -307,8 +303,6 @@ pub struct BridgeConfig {
     pub drive: DriveSelect,
     /// Port selection.
     pub port: PortSelection,
-    /// Whether the worker may capture nearby tracks while idle.
-    pub auto_cache: bool,
     /// Maximum duration for a stalling read.
     pub stall_timeout: Duration,
 }
@@ -321,7 +315,6 @@ impl Default for BridgeConfig {
             density: DensityMode::Auto,
             drive: DriveSelect::PcA,
             port: PortSelection::Auto,
-            auto_cache: false,
             stall_timeout: Duration::from_millis(450),
         }
     }

@@ -382,7 +382,7 @@ impl Greaseweazle {
                         progress(pack_bits(&bits), bits.len());
                         return Ok(bits);
                     }
-                    if raw.len() >= published + 8 * 1024
+                    if raw.len() >= published + 4 * 1024
                         && let Ok(events) =
                             decode_stream(&raw, self.sample_frequency, self.high_density)
                     {
