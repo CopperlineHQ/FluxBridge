@@ -18,6 +18,8 @@ use crate::{
 
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 64;
+/// Hard ceiling on readings kept per track. How many are wanted at any moment
+/// is decided by [`wanted_depth`]; this only bounds the queue behind it.
 const CAPTURES_PER_TRACK: usize = 2;
 const MAX_CACHED_TRACKS: usize = 8;
 const INDEX_WRITE_SLACK_BITS: usize = 30;
@@ -43,6 +45,14 @@ struct Desired {
     target: Option<TrackAddress>,
 }
 
+/// Everything a worker shares with the [`Bridge`] that owns it.
+struct SharedState {
+    status: Arc<Mutex<DriveStatus>>,
+    captures: Arc<Mutex<CaptureCache>>,
+    desired: Arc<Mutex<Desired>>,
+    nudge: Receiver<()>,
+}
+
 /// Consecutive device errors after which the drive is declared lost.
 ///
 /// A spinning mechanism has weather -- an overflowed capture, a read racing a
@@ -63,6 +73,9 @@ pub struct Bridge {
     status: Arc<Mutex<DriveStatus>>,
     captures: Arc<Mutex<CaptureCache>>,
     desired: Arc<Mutex<Desired>>,
+    /// Wakes the worker the moment a wish changes, so acting on it is not held
+    /// for the tail of a poll interval.
+    nudge: Sender<()>,
     selected_port: PortId,
     next_write: u64,
     max_cylinders: u8,
@@ -95,23 +108,18 @@ impl Bridge {
         let status = Arc::new(Mutex::new(initial_status));
         let captures = Arc::new(Mutex::new(HashMap::new()));
         let desired = Arc::new(Mutex::new(Desired::default()));
-        let worker_status = Arc::clone(&status);
-        let worker_captures = Arc::clone(&captures);
-        let worker_desired = Arc::clone(&desired);
+        let (nudge_tx, nudge_rx) = bounded(1);
+        let shared = SharedState {
+            status: Arc::clone(&status),
+            captures: Arc::clone(&captures),
+            desired: Arc::clone(&desired),
+            nudge: nudge_rx,
+        };
         let stall_timeout = (config.mode == ReadMode::Stalling).then_some(config.stall_timeout);
         let worker = thread::Builder::new()
             .name(format!("fluxbridge-{}", config.driver))
             .spawn(move || {
-                Worker::new(
-                    config,
-                    device,
-                    command_rx,
-                    event_tx,
-                    worker_status,
-                    worker_captures,
-                    worker_desired,
-                )
-                .run();
+                Worker::new(config, device, command_rx, event_tx, shared).run();
             })
             .expect("FluxBridge worker thread creation must succeed");
 
@@ -121,12 +129,19 @@ impl Bridge {
             status,
             captures,
             desired,
+            nudge: nudge_tx,
             selected_port,
             next_write: 1,
             max_cylinders: initial_status.max_cylinders,
             stall_timeout,
             worker: Some(worker),
         }
+    }
+
+    /// Wakes the worker so a fresh wish is seen now rather than at the end of
+    /// its poll interval. A full slot already means a wake-up is on its way.
+    fn nudge(&self) {
+        let _ = self.nudge.try_send(());
     }
 
     /// Returns the port selected during open.
@@ -146,6 +161,7 @@ impl Bridge {
     /// physical spindle. Cannot fail and cannot be lost.
     pub fn set_motor(&mut self, side: crate::Side, enabled: bool) -> Result<()> {
         lock(&self.desired).motor = Some((side, enabled));
+        self.nudge();
         Ok(())
     }
 
@@ -157,6 +173,7 @@ impl Bridge {
     /// cylinder it was ever asked for on the way.
     pub fn seek(&mut self, track: TrackAddress) -> Result<()> {
         lock(&self.desired).target = Some(device::clamp_track(track, self.max_cylinders));
+        self.nudge();
         Ok(())
     }
 
@@ -178,6 +195,9 @@ impl Bridge {
         if let Some(capture) = capture() {
             return Ok(Some(capture));
         }
+        // A miss means someone is actively waiting on this track: worth waking
+        // the worker for, where a hit needed nothing from it.
+        self.nudge();
         if let Some(timeout) = self.stall_timeout {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
@@ -202,6 +222,7 @@ impl Bridge {
         // The worker refills any track below its capture depth on its own;
         // naming the track keeps the head there while it does.
         lock(&self.desired).target = Some(track);
+        self.nudge();
         Ok(())
     }
 
@@ -302,6 +323,7 @@ struct Worker {
     status: Arc<Mutex<DriveStatus>>,
     captures: Arc<Mutex<CaptureCache>>,
     desired: Arc<Mutex<Desired>>,
+    nudge: Receiver<()>,
     target: TrackAddress,
     physical: TrackAddress,
     positioned: bool,
@@ -321,18 +343,17 @@ impl Worker {
         device: Box<dyn Device>,
         commands: Receiver<Command>,
         events: Sender<BridgeEvent>,
-        status: Arc<Mutex<DriveStatus>>,
-        captures: Arc<Mutex<CaptureCache>>,
-        desired: Arc<Mutex<Desired>>,
+        shared: SharedState,
     ) -> Self {
         Self {
             config,
             device,
             commands,
             events,
-            status,
-            captures,
-            desired,
+            status: shared.status,
+            captures: shared.captures,
+            desired: shared.desired,
+            nudge: shared.nudge,
             target: TrackAddress::default(),
             physical: TrackAddress::default(),
             positioned: false,
@@ -346,11 +367,21 @@ impl Worker {
 
     fn run(mut self) {
         let mut shutdown = false;
+        // Set when the previous pass took a reading: more work is likely
+        // waiting -- the retry behind an unproven capture, or a target that
+        // moved while the disk was turning -- so go straight round rather
+        // than sleeping on the channels.
+        let mut hot = false;
         while !shutdown {
-            match self.commands.recv_timeout(Duration::from_millis(5)) {
-                Ok(command) => shutdown = self.process(command),
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            if !hot {
+                crossbeam_channel::select! {
+                    recv(self.commands) -> command => match command {
+                        Ok(command) => shutdown = self.process(command),
+                        Err(_) => break,
+                    },
+                    recv(self.nudge) -> _ => {}
+                    default(Duration::from_millis(5)) => {}
+                }
             }
             if shutdown {
                 break;
@@ -372,7 +403,7 @@ impl Worker {
             if self.failed {
                 break;
             }
-            self.capture_if_needed();
+            hot = self.capture_if_needed();
             if self.failed {
                 break;
             }
@@ -497,16 +528,22 @@ impl Worker {
         let _ = self.events.try_send(event);
     }
 
-    fn capture_if_needed(&mut self) {
+    /// Captures whatever the cache is short of, returning whether a reading
+    /// was actually taken -- the signal to go straight round again rather than
+    /// wait for something to ask.
+    fn capture_if_needed(&mut self) -> bool {
         let status = *lock(&self.status);
         if !status.working || !status.motor_running || !status.disk_present {
-            return;
+            return false;
         }
 
         let mut wanted = self.target;
-        let target_full = lock(&self.captures)
-            .get(&self.target)
-            .is_some_and(|captures| captures.len() >= CAPTURES_PER_TRACK);
+        let target_full = {
+            let cache = lock(&self.captures);
+            let captures = cache.get(&self.target);
+            let depth = wanted_depth(captures.and_then(VecDeque::back));
+            captures.is_some_and(|captures| captures.len() >= depth)
+        };
         if target_full && self.config.auto_cache {
             let max = status.max_cylinders.max(1);
             self.cache_cursor = self.cache_cursor.wrapping_add(1) % max;
@@ -515,15 +552,15 @@ impl Worker {
                 .get(&wanted)
                 .is_some_and(|captures| !captures.is_empty())
             {
-                return;
+                return false;
             }
         } else if target_full {
-            return;
+            return false;
         }
 
         if let Err(error) = self.position(wanted) {
             self.note_error(error);
-            return;
+            return false;
         }
         let capture = match self
             .device
@@ -532,15 +569,15 @@ impl Worker {
             Ok(capture) => capture,
             // No index came round: the platter is stopping, spinning up, or
             // holds no disk. That is a state of the world, not a fault.
-            Err(Error::Timeout(_)) => return,
+            Err(Error::Timeout(_)) => return false,
             Err(error) => {
                 self.note_error(error);
-                return;
+                return false;
             }
         };
         if let Err(error) = device::validate_capture(&capture) {
             self.note_error(error);
-            return;
+            return false;
         }
         self.consecutive_errors = 0;
         self.generation = self.generation.wrapping_add(1);
@@ -569,6 +606,7 @@ impl Worker {
             captures.pop_front();
         }
         captures.push_back(capture);
+        true
     }
 
     fn refresh_status_if_due(&mut self) {
@@ -598,6 +636,24 @@ impl Worker {
         self.failed = true;
         lock(&self.status).working = false;
         let _ = self.events.try_send(BridgeEvent::Disconnected(error));
+    }
+}
+
+/// How many readings of a track are worth holding, given the newest one.
+///
+/// A reading that cannot be turned under the head twice is consumed and
+/// advanced past, so its successor is stocked ahead: the retry is already in
+/// hand when the consumer asks for it. A replayable reading is kept by the
+/// consumer for as long as it is wanted, and a second would almost always go
+/// unread -- while the capture taking it sat in front of whichever track the
+/// machine asked for next, uninterruptible once begun. Measured over a
+/// Workbench boot, those speculative readings were discarded rather than
+/// served about nineteen times in twenty, at a capture window of dead time
+/// apiece.
+fn wanted_depth(newest: Option<&TrackCapture>) -> usize {
+    match newest {
+        Some(capture) if !capture.quality().reusable() => CAPTURES_PER_TRACK,
+        _ => 1,
     }
 }
 
@@ -789,6 +845,7 @@ mod tests {
     fn motor_and_seek_are_state_and_survive_any_flood() {
         let (commands, _command_rx) = bounded(1);
         let (_event_tx, events) = bounded(1);
+        let (nudge_tx, _nudge_rx) = bounded(1);
         let desired = Arc::new(Mutex::new(Desired::default()));
         let mut bridge = Bridge {
             commands,
@@ -796,6 +853,7 @@ mod tests {
             status: Arc::new(Mutex::new(DriveStatus::default())),
             captures: Arc::new(Mutex::new(HashMap::new())),
             desired: Arc::clone(&desired),
+            nudge: nudge_tx,
             selected_port: PortId::new("fake").unwrap(),
             next_write: 1,
             max_cylinders: 80,

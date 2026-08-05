@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::device::{Device, RawCapture, drive_selection, operation_deadline, validate_capture};
 use crate::flux::{FluxEvent, flux_to_revolution, flux_to_unaligned_revolution, mfm_to_flux};
-use crate::transport::{self, Transport, read_exact_until, write_all_until};
+use crate::transport::{self, Transport, read_exact_until, read_terminated_until, write_all_until};
 use crate::{
     BridgeConfig, DensityMode, DriveStatus, DriveType, Error, PortId, ReadMode, Result, Side,
 };
@@ -301,40 +301,30 @@ impl Greaseweazle {
         // scheduling weather, not a fault of the disk -- so it is worth a
         // fresh revolution before it is reported. Upstream FloppyDriveBridge
         // retries these five deep; a couple is enough with a purged pipe.
-        let mut stream = Vec::new();
         let mut attempt = 0_u32;
-        loop {
+        let stream = loop {
             attempt += 1;
             self.expect_ok(Command::ReadFlux, &header)?;
 
             let deadline = Instant::now() + STREAM_TIMEOUT;
-            stream.clear();
-            stream.reserve(128 * 1024);
-            loop {
-                if stream.len() >= MAX_STREAM_BYTES {
-                    return Err(Error::TrackTooLarge {
-                        bits: stream.len() * 8,
-                        limit: MAX_STREAM_BYTES * 8,
-                    });
-                }
-                let mut byte = [0_u8];
-                read_exact_until(
-                    self.transport.as_mut(),
-                    &mut byte,
-                    deadline,
-                    "Greaseweazle flux stream",
-                )?;
-                if byte[0] == 0 {
-                    break;
-                }
-                stream.push(byte[0]);
+            let stream = read_terminated_until(
+                self.transport.as_mut(),
+                deadline,
+                MAX_STREAM_BYTES,
+                "Greaseweazle flux stream",
+            )?;
+            if stream.len() >= MAX_STREAM_BYTES {
+                return Err(Error::TrackTooLarge {
+                    bits: stream.len() * 8,
+                    limit: MAX_STREAM_BYTES * 8,
+                });
             }
             let status = self.raw_command_ack(Command::GetFluxStatus, &[])?;
             match status {
                 ACK_OK => {
                     self.status.disk_present = true;
                     self.status.ready = true;
-                    break;
+                    break stream;
                 }
                 ACK_NO_INDEX => {
                     self.status.disk_present = false;
@@ -350,7 +340,7 @@ impl Greaseweazle {
                 }
                 other => map_ack(Command::GetFluxStatus, other)?,
             }
-        }
+        };
         if !self.status.motor_running {
             self.select(false)?;
         }
