@@ -88,8 +88,7 @@ work differently. [NOTICE.md](NOTICE.md) records the provenance;
 ## Acknowledgements
 
 Rob Smith (FloppyDriveBridge), Keir Fraser (Greaseweazle), Jim Drew /
-CBMSTUFF.COM (SuperCard Pro). The method -- what a drive must do for an
-emulated machine, and how -- is Lee Hobson's, proven on his hardware.
+CBMSTUFF.COM (SuperCard Pro).
 
 ## Licensing
 
