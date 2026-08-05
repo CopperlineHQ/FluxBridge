@@ -469,7 +469,7 @@ impl Greaseweazle {
         // The immediate window holds one revolution plus the overlap the join
         // needs: the anchors' reach past a revolution, with margin for a drive
         // running slow, where the same cells take longer to pass the head.
-        let (ticks, max_index, linger) = if mode == ReadMode::Fast {
+        let (ticks, max_index, linger) = if mode == ReadMode::Normal {
             (
                 u32::try_from(u64::from(self.sample_frequency) * 232 / 1_000)
                     .expect("232ms tick count fits u32"),
@@ -539,7 +539,7 @@ impl Greaseweazle {
         }
 
         let events = self.decode_at_density(&stream, density)?;
-        let index_aligned = mode != ReadMode::Fast;
+        let index_aligned = mode != ReadMode::Normal;
         let (words, bit_len, extracted_index) = if index_aligned {
             flux_to_revolution(&events)?
         } else {
@@ -702,7 +702,7 @@ impl Device for Greaseweazle {
         density: DensityMode,
         progress: &mut dyn FnMut(Vec<u16>, usize),
     ) -> Result<RawCapture> {
-        if mode == ReadMode::Fast {
+        if mode == ReadMode::Normal {
             self.read_stream_fast(density, progress)
         } else {
             self.read_stream(mode, density)

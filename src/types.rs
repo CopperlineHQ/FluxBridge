@@ -202,7 +202,7 @@ pub enum PortSelection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReadMode {
     /// Capture without waiting for the index pulse.
-    Fast,
+    Normal,
     /// Capture an index-aligned revolution.
     #[default]
     Compatible,

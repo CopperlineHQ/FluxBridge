@@ -194,7 +194,7 @@ impl SuperCardPro {
         self.select(true)?;
         // Raw flux, 8-bit counters, 50ns base resolution. Compatible and
         // stalling reads request stream-from-index; fast reads start now.
-        let flags = 0x04 | 0x02 | u8::from(mode != ReadMode::Fast);
+        let flags = 0x04 | 0x02 | u8::from(mode != ReadMode::Normal);
         let response = self.raw_command(Command::StartStream, &[flags])?;
         match response {
             RESPONSE_OK => {}
@@ -212,7 +212,7 @@ impl SuperCardPro {
         let mut saw_ff = false;
         let mut indices = 0_u8;
         let mut bytes_seen = 0_usize;
-        let target_duration = if mode == ReadMode::Fast {
+        let target_duration = if mode == ReadMode::Normal {
             260_000_000_u64
         } else {
             u64::MAX
@@ -239,7 +239,7 @@ impl SuperCardPro {
                 saw_ff = false;
                 if byte == 0 {
                     indices = indices.saturating_add(1);
-                    if indices >= 2 && mode != ReadMode::Fast {
+                    if indices >= 2 && mode != ReadMode::Normal {
                         break;
                     }
                     pending_index = true;
@@ -307,7 +307,7 @@ impl SuperCardPro {
             self.select(false)?;
         }
 
-        let (words, bit_len, index_aligned) = if mode == ReadMode::Fast {
+        let (words, bit_len, index_aligned) = if mode == ReadMode::Normal {
             let (words, bit_len) = flux_to_unaligned_revolution(&events, self.high_density)?;
             (words, bit_len, false)
         } else {
@@ -316,7 +316,7 @@ impl SuperCardPro {
         let capture = RawCapture {
             words,
             bit_len,
-            index_aligned: mode != ReadMode::Fast && index_aligned,
+            index_aligned: mode != ReadMode::Normal && index_aligned,
         };
         validate_capture(&capture)?;
         Ok(capture)

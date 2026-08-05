@@ -45,7 +45,7 @@ revolution is ready. `ReadMode::Stalling` is the sole exception: it may wait for
 at most `stall_timeout`. A `TrackCapture` contains packed MSB-first `u16` words,
 an exact bit length, a monotonic generation, and a `CaptureQuality`.
 
-While a `ReadMode::Fast` capture is still arriving, `partial_track` returns
+While a `ReadMode::Normal` capture is still arriving, `partial_track` returns
 the revolution as far as the head has read it: a monotonically growing prefix
 of the same words the finished capture will contain. A consumer can serve
 those bits at the platter's real pace instead of waiting out the remainder of

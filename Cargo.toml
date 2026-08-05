@@ -2,7 +2,7 @@
 
 [package]
 name = "fluxbridge"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.93"
 authors = ["Lee Hobson", "Copperline contributors"]

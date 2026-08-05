@@ -33,7 +33,7 @@ enables `greaseweazle` only.
   capture, `partial_track` returns the decoded revolution so far, so the
   consumer can serve the early sectors while the later ones are still under
   the head.
-- `ReadMode` selects the capture strategy: `Fast` captures immediately
+- `ReadMode` selects the capture strategy: `Normal` captures immediately
   without waiting for the index pulse, `Compatible` captures from one index
   pulse to the next, `Stalling` is index-aligned and may block the caller up
   to `stall_timeout`.
