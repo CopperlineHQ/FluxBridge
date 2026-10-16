@@ -277,7 +277,8 @@ mod serial {
 mod ftdi {
     use super::*;
     use ftdi_nusb::{
-        DataBits, DeviceFilter, FlowControl, FtdiDevice, Interface, Parity, StopBits, find_devices,
+        DataBits, DeviceFilter, FlowControl, Interface, Parity, StopBits, blocking::FtdiDevice,
+        find_devices,
     };
 
     const FTDI_VID: u16 = 0x0403;
